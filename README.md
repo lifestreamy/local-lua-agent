@@ -1,6 +1,6 @@
 # template
 
-Template for task: Репозиторий для работы
+MWS Octapi: Репозиторий для работы (система для генерации кода LocalScript)
 
 ## Getting started
 
