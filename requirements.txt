@@ -2,7 +2,11 @@
 # Stack: FastAPI + Pydantic + httpx (Ollama HTTP) + uvicorn
 # No OpenAI / Anthropic / LangChain — Ollama called directly via HTTP
 
-fastapi==0.115.12
-uvicorn[standard]==0.34.0
-pydantic==2.11.2
+# fastapi: https://pypi.org/project/fastapi/ (latest 0.135.3)
+fastapi==0.135.3
+# uvicorn: https://pypi.org/project/uvicorn/ (latest 0.44.0)
+uvicorn[standard]==0.44.0
+# pydantic: https://pypi.org/project/pydantic/ (latest 2.12.5)
+pydantic==2.12.5
+# httpx: https://pypi.org/project/httpx/ (latest 0.28.1)
 httpx==0.28.1
