@@ -1,6 +1,4 @@
-# =========================
 # Python / Virtual Envs
-# =========================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -9,9 +7,7 @@ venv/
 env/
 .env
 
-# =========================
 # JetBrains (PyCharm / IntelliJ)
-# =========================
 .idea/
 # Whitelist shared run configurations
 !.idea/runConfigurations/
@@ -19,9 +15,7 @@ env/
 !.idea/codeStyles/
 !.idea/dictionaries/
 
-# =========================
 # VSCode / Cursor
-# =========================
 .vscode/*
 # Whitelist shared launch configs and settings
 !.vscode/settings.json
@@ -29,8 +23,9 @@ env/
 !.vscode/launch.json
 !.vscode/extensions.json
 
-# =========================
 # OS Files
-# =========================
 .DS_Store
 Thumbs.db
+
+# Jujutsu VCS
+.jj/
