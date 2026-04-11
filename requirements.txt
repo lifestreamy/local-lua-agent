@@ -1,0 +1,8 @@
+# LocalScript — Python dependencies
+# Stack: FastAPI + Pydantic + httpx (Ollama HTTP) + uvicorn
+# No OpenAI / Anthropic / LangChain — Ollama called directly via HTTP
+
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+pydantic==2.11.2
+httpx==0.28.1
