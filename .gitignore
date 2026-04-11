@@ -1,0 +1,36 @@
+# =========================
+# Python / Virtual Envs
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# =========================
+# JetBrains (PyCharm / IntelliJ)
+# =========================
+.idea/
+# Whitelist shared run configurations
+!.idea/runConfigurations/
+# (Optional) whitelist code style and dicts if you want to share them
+!.idea/codeStyles/
+!.idea/dictionaries/
+
+# =========================
+# VSCode / Cursor
+# =========================
+.vscode/*
+# Whitelist shared launch configs and settings
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# =========================
+# OS Files
+# =========================
+.DS_Store
+Thumbs.db
