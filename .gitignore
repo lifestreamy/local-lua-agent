@@ -29,3 +29,9 @@ Thumbs.db
 
 # Jujutsu VCS
 .jj/
+
+# Python Tests
+tests/reports/
+tests/reports/*.json
+tests/reports/*.md
+tests/reports/*.log
