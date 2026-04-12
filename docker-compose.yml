@@ -1,0 +1,45 @@
+# docker-compose.yml — LocalScript: two services
+#   api    — FastAPI app (this repo, port 8080)
+#   ollama — Ollama server with pre-pulled model (port 11434)
+#
+# Launch: docker-compose up --build
+# Test:   curl -X POST http://localhost:8080/generate \
+#              -H "Content-Type: application/json" \
+#              -d '{"prompt": "get last email from list"}'
+
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Ollama reachable at service name "ollama" inside Docker network
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      OLLAMA_MODEL: "qwen2.5-coder:7b-instruct-q4_K_M"
+      MAX_RETRIES: "3"
+      # Set DRY_RUN=true here if you want to skip luac during Docker testing
+      DRY_RUN: "false"
+    depends_on:
+      - ollama
+    restart: on-failure
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persist downloaded models — avoids re-pulling on every docker-compose up
+      - ollama_data:/root/.ollama
+    # GPU passthrough — comment out if no NVIDIA GPU available
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ollama_data:
