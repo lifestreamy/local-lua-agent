@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LocalScript Web UI</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <link
+      id="hljs-theme"
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css"
+    />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Список чатов">
+        <div class="sidebar-head">
+          <button id="new-chat-btn" type="button" class="btn-sidebar-new">
+            + Новый чат
+          </button>
+        </div>
+        <ul id="chat-list" class="chat-list"></ul>
+      </aside>
+
+      <div class="main-column">
+        <main class="container">
+          <header class="header">
+            <h1>LocalScript Web UI</h1>
+            <div class="header-actions">
+              <button
+                id="theme-toggle"
+                type="button"
+                class="btn-secondary"
+                aria-label="Переключить светлую и тёмную тему"
+              >
+                Светлая тема
+              </button>
+              <div class="health">
+                <span id="health-dot" class="dot dot-unknown" aria-hidden="true"></span>
+                <span id="health-text">Проверка API...</span>
+              </div>
+            </div>
+          </header>
+
+          <section class="panel history-controls">
+            <label class="checkbox-label">
+              <input type="checkbox" id="use-history" checked />
+              Учитывать историю в этом чате
+            </label>
+            <button id="clear-history" type="button" class="btn-secondary btn-small">
+              Очистить историю чата
+            </button>
+          </section>
+
+          <section class="panel">
+            <div class="output-header">
+              <h2>Диалог</h2>
+            </div>
+            <div id="chat-history" class="chat-history" aria-live="polite"></div>
+          </section>
+
+          <section class="panel">
+            <label for="prompt-input" class="label">Запрос (обязательно)</label>
+            <textarea
+              id="prompt-input"
+              rows="6"
+              placeholder="Например: отфильтровать заказы со статусом выполнен"
+            ></textarea>
+          </section>
+
+          <section class="panel">
+            <label for="context-input" class="label">Контекст (необязательно)</label>
+            <textarea
+              id="context-input"
+              rows="6"
+              placeholder="Вставьте существующий Lua-код для доработки"
+            ></textarea>
+          </section>
+
+          <section class="actions">
+            <button id="submit-btn" type="button">Отправить</button>
+            <button
+              id="cancel-generate-btn"
+              type="button"
+              class="btn-cancel hidden"
+              aria-label="Отменить генерацию"
+            >
+              Отменить
+            </button>
+            <div id="spinner" class="spinner hidden" aria-label="Загрузка"></div>
+          </section>
+
+          <section class="panel">
+            <div class="output-header">
+              <h2>Сгенерированный Lua-код</h2>
+              <button id="copy-btn" type="button">Скопировать код</button>
+            </div>
+            <pre><code id="code-output" class="language-lua">-- Здесь появится Lua-код</code></pre>
+          </section>
+
+          <p id="message" class="message" role="status" aria-live="polite"></p>
+        </main>
+      </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+    <script src="./main.js"></script>
+  </body>
+</html>
