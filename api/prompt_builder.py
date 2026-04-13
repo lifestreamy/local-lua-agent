@@ -2,8 +2,9 @@
 api/prompt_builder.py — Assembles the full prompt string for Ollama.
 
 Reads system_prompt.txt once at import time (cached).
-On each call, appends the user query and optionally a previous error context
-so the model knows what went wrong and can fix it.
+On each call, appends the user query and optionally:
+  - context   (existing Lua code the user wants to modify)
+  - error_ctx (luac error from the previous attempt for fix iterations)
 """
 
 import logging
@@ -26,22 +27,37 @@ _SYSTEM_PROMPT: str = _load_system_prompt()
 
 
 class PromptBuilder:
-    """Builds the full prompt string to send to the Ollama /api/generate endpoint."""
+    """Строит финальную строку промпта для отправки в Ollama /api/generate."""
 
-    def build(self, user_query: str, error_context: str | None = None) -> str:
+    def build(
+            self,
+            prompt: str,
+            context: str | None = None,
+            error_context: str | None = None,
+    ) -> str:
         """
-        Assemble the full prompt.
+        Собирает финальный промпт из системного шаблона, опционального контекста и задачи.
 
-        Args:
-            user_query:    The natural language task from the user.
-            error_context: luac error from the previous attempt (fix iteration).
-                           If None, this is the first attempt.
+        Аргументы:
+            prompt:        Текстовый запрос пользователя на естественном языке.
+            context:       Существующий Lua-код для доработки (опционально).
+                           Если передан — вставляется в промпт как блок EXISTING CODE TO MODIFY.
+            error_context: Ошибка luac из предыдущей попытки (для retry-цикла).
+                           Если передан — модель видит что сломалось и пытается исправить.
 
-        Returns:
-            Full prompt string ready to send to Ollama.
+        Возвращает:
+            Готовую строку промпта для отправки в Ollama.
         """
         parts: list[str] = [_SYSTEM_PROMPT.strip(), ""]
 
+        # Вставляем блок с существующим кодом, если пользователь хочет доработать его
+        if context and context.strip():
+            parts.append(
+                f"EXISTING CODE TO MODIFY:\n```lua\n{context.strip()}\n```"
+            )
+            parts.append("")
+
+        # При retry — показываем модели ошибку прошлой попытки
         if error_context:
             parts.append(
                 f"## Previous attempt failed\n"
@@ -50,7 +66,7 @@ class PromptBuilder:
                 f"Fix the error and output corrected Lua code only.\n"
             )
 
-        parts.append(f"User: {user_query.strip()}")
+        parts.append(f"User: {prompt.strip()}")
         parts.append("Code:")
 
         return "\n".join(parts)
