@@ -10,6 +10,35 @@ import { generateWithSseReady } from "@/lib/api";
 
 const STORE_KEY = "localscript-next-state-v1";
 const THEME_KEY = "localscript-next-theme-v1";
+const STATUS_STEPS = [
+  { key: "pending", label: "Ожидание" },
+  { key: "generating", label: "Генерация" },
+  { key: "validating", label: "Проверка" },
+  { key: "retrying", label: "Повтор" },
+  { key: "done", label: "Готово" },
+];
+const STATUS_PROGRESS_MAP = {
+  pending: 8,
+  generating: 35,
+  validating: 70,
+  retrying: 55,
+  done: 100,
+  error: 100,
+  cancelled: 100,
+};
+const STATUS_LABELS = Object.fromEntries(STATUS_STEPS.map((step) => [step.key, step.label]));
+const CHANNEL_LABELS = {
+  sync: "Синхронный ответ /generate",
+  sse: "SSE поток статусов",
+  "sse + polling fallback": "SSE + fallback polling /status",
+};
+const ROLLING_CONTEXT_LIMIT = 4096;
+const DEBUG_UI = true;
+
+function uiDebug(event, payload = {}) {
+  if (!DEBUG_UI) return;
+  console.log(`[UI DEBUG] ${event}`, payload);
+}
 
 function newId(prefix) {
   if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
@@ -26,6 +55,41 @@ function nowRu(ts) {
   });
 }
 
+function buildRollingContext(messages, maxChars = ROLLING_CONTEXT_LIMIT) {
+  const turns = (messages || [])
+    .filter((m) => m && m.status === "done")
+    .map((m) => {
+      const userPrompt = String(m.prompt || "").trim();
+      const assistantText = String(m.assistantText || "").trim();
+      const code = String(m.code || "").trim();
+
+      const poisonedText = assistantText.toLowerCase().includes("запрос заблокирован системой безопасности");
+      const poisonedCode = code.includes("[SECURITY_BLOCK]");
+      if (poisonedText || poisonedCode) return "";
+
+      const blocks = [];
+      if (userPrompt) blocks.push(`User: ${userPrompt}`);
+      if (assistantText) blocks.push(`Assistant: ${assistantText}`);
+      if (code) blocks.push(`\`\`\`lua\n${code}\n\`\`\``);
+      return blocks.join("\n");
+    })
+    .filter(Boolean);
+
+  // Keep newest turns under hard limit by dropping oldest turns first.
+  const selected = [];
+  let totalLen = 0;
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const turn = turns[i];
+    const sep = selected.length ? "\n" : "";
+    const nextLen = totalLen + sep.length + turn.length;
+    if (nextLen > maxChars) break;
+    selected.push(turn);
+    totalLen = nextLen;
+  }
+
+  return selected.reverse().join("\n");
+}
+
 function createChat() {
   return {
     id: newId("chat"),
@@ -34,7 +98,6 @@ function createChat() {
     updatedAt: Date.now(),
     lastRequestAt: null,
     draftPrompt: "",
-    draftContext: "",
     messages: [],
   };
 }
@@ -45,9 +108,12 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [apiStatus, setApiStatus] = useState("Проверка API...");
   const [timeline, setTimeline] = useState([]);
+  const [statusChannel, setStatusChannel] = useState("sync");
   const [theme, setTheme] = useState("light");
   const [errorMsg, setErrorMsg] = useState("");
   const [abortController, setAbortController] = useState(null);
+  /** Последние prompt/context, ушедшие в POST /generate (для ручной проверки). */
+  const [lastWirePayload, setLastWirePayload] = useState(null);
 
   useEffect(() => {
     try {
@@ -67,17 +133,20 @@ export default function Page() {
     fresh.activeId = fresh.chats[0].id;
     setState(fresh);
     setActiveId(fresh.activeId);
+    uiDebug("state:init_fresh", fresh);
   }, []);
 
   useEffect(() => {
     const saved = localStorage.getItem(THEME_KEY);
     if (saved === "dark" || saved === "light") {
       setTheme(saved);
+      uiDebug("theme:loaded", { theme: saved });
     }
   }, []);
 
   useEffect(() => {
     localStorage.setItem(THEME_KEY, theme);
+    uiDebug("theme:saved", { theme });
   }, [theme]);
 
   useEffect(() => {
@@ -120,7 +189,43 @@ export default function Page() {
     });
   }
 
+  function patchChatById(chatId, patcher) {
+    setState((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        chats: prev.chats.map((chat) => (chat.id === chatId ? patcher(chat) : chat)),
+      };
+    });
+  }
+
+  function pushTimelineEvent(event) {
+    if (!event?.phase) return;
+    setTimeline((prev) => {
+      const item = {
+        id: newId("evt"),
+        phase: String(event.phase),
+        message: String(event.message || ""),
+        progress:
+          typeof event.progress === "number"
+            ? Math.max(0, Math.min(100, event.progress))
+            : null,
+      };
+      const last = prev[prev.length - 1];
+      if (
+        last &&
+        last.phase === item.phase &&
+        last.message === item.message &&
+        last.progress === item.progress
+      ) {
+        return prev;
+      }
+      return [...prev, item].slice(-40);
+    });
+  }
+
   function createNewChat() {
+    uiDebug("chat:create_click");
     const chat = createChat();
     setState((prev) => ({ ...prev, chats: [chat, ...prev.chats] }));
     setActiveId(chat.id);
@@ -129,6 +234,7 @@ export default function Page() {
   }
 
   function deleteChat(chatId) {
+    uiDebug("chat:delete_click", { chatId });
     setState((prev) => {
       const chats = prev.chats.filter((c) => c.id !== chatId);
       if (!chats.length) chats.push(createChat());
@@ -139,9 +245,10 @@ export default function Page() {
   }
 
   function renameChat(chat) {
+    uiDebug("chat:rename_click", { chatId: chat.id, prevTitle: chat.title });
     const name = window.prompt("Название чата", chat.title || "Новый чат");
     if (name === null) return;
-    patchActiveChat((c) =>
+    patchChatById(chat.id, (c) =>
       c.id !== chat.id
         ? c
         : {
@@ -153,15 +260,23 @@ export default function Page() {
   }
 
   async function onSubmit() {
+    uiDebug("submit:click", { activeId });
     if (!activeChat) return;
     const prompt = activeChat.draftPrompt.trim();
-    const context = activeChat.draftContext.trim();
+    const context = buildRollingContext(activeChat.messages);
+    uiDebug("submit:prepared", { promptLength: prompt.length, contextLength: context.length });
+    if (DEBUG_UI) {
+      setLastWirePayload({ at: Date.now(), prompt, context });
+      uiDebug("submit:wire_payload", { prompt, context });
+    }
     if (!prompt) {
       setErrorMsg("Поле «Запрос» обязательно.");
+      uiDebug("submit:blocked_empty_prompt");
       return;
     }
     setErrorMsg("");
-    setTimeline(["pending"]);
+    setTimeline([]);
+    setStatusChannel("sync");
     const turnId = newId("turn");
     patchActiveChat((chat) => ({
       ...chat,
@@ -170,7 +285,7 @@ export default function Page() {
       draftPrompt: "",
       messages: [
         ...chat.messages,
-        { id: turnId, prompt, context, code: "", status: "pending" },
+        { id: turnId, prompt, context, code: "", assistantText: "", status: "pending" },
       ],
     }));
 
@@ -180,20 +295,59 @@ export default function Page() {
 
     let finalCode = "";
     try {
+      uiDebug("submit:request_started", { turnId });
       await generateWithSseReady({
         prompt,
         context,
         signal: controller.signal,
         onStatus: (status) => {
-          const normalized = String(status || "").toLowerCase();
-          setTimeline((prev) =>
-            prev.includes(normalized) ? prev : [...prev, normalized]
-          );
+          uiDebug("status:update", { status });
+          pushTimelineEvent({ phase: String(status || "").toLowerCase() });
         },
         onCodeChunk: (chunk) => {
-          finalCode += chunk;
+          const piece = String(chunk || "");
+          uiDebug("code:chunk", { chunkLength: piece.length });
+          // Backend may send full code snapshots on multiple stages.
+          if (!finalCode) {
+            finalCode = piece;
+          } else if (piece === finalCode || finalCode.startsWith(piece)) {
+            // duplicate or shorter snapshot, keep current
+          } else if (piece.startsWith(finalCode)) {
+            finalCode = piece;
+          } else {
+            finalCode += piece;
+          }
+        },
+        onAssistantMessage: (text) => {
+          const clean = String(text || "").trim();
+          if (!clean) return;
+          uiDebug("assistant:message", { textLength: clean.length, text: clean });
+          patchActiveChat((chat) => ({
+            ...chat,
+            messages: chat.messages.map((m) =>
+              m.id === turnId
+                ? {
+                    ...m,
+                    assistantText: m.assistantText
+                      ? `${m.assistantText}\n\n${clean}`
+                      : clean,
+                  }
+                : m
+            ),
+          }));
+        },
+        onTimelineEvent: (event) => {
+          uiDebug("timeline:event", event || {});
+          const message = String(event?.message || "").toLowerCase();
+          if (message.includes("polling")) {
+            setStatusChannel("sse + polling fallback");
+          } else if (message.includes("task_id") || message.includes("sse")) {
+            setStatusChannel("sse");
+          }
+          pushTimelineEvent(event);
         },
       });
+      uiDebug("submit:request_success", { turnId, finalCodeLength: finalCode.length });
 
       patchActiveChat((chat) => {
         const messages = chat.messages.map((m) =>
@@ -206,6 +360,11 @@ export default function Page() {
         return { ...chat, messages, title, updatedAt: Date.now() };
       });
     } catch (error) {
+      uiDebug("submit:request_error", {
+        turnId,
+        name: error?.name,
+        message: error?.message,
+      });
       const isAbort = error?.name === "AbortError";
       patchActiveChat((chat) => ({
         ...chat,
@@ -221,6 +380,7 @@ export default function Page() {
       }));
       setErrorMsg(isAbort ? "Генерация отменена." : `Ошибка: ${error.message}`);
     } finally {
+      uiDebug("submit:request_finished", { turnId });
       setLoading(false);
       setAbortController(null);
     }
@@ -231,6 +391,12 @@ export default function Page() {
   }
 
   const isDark = theme === "dark";
+  const completedPhases = new Set(timeline.map((event) => event.phase));
+  const currentPhase = timeline[timeline.length - 1]?.phase || "";
+  const latestProgress = timeline[timeline.length - 1]?.progress;
+  const derivedProgress =
+    latestProgress ?? STATUS_PROGRESS_MAP[currentPhase] ?? (timeline.length ? 8 : 0);
+  const channelLabel = CHANNEL_LABELS[statusChannel] || statusChannel;
 
   return (
     <div
@@ -251,10 +417,17 @@ export default function Page() {
           </CardHeader>
           <CardContent className="space-y-2">
             {sortedChats.map((chat) => (
-              <button
+              <div
                 key={chat.id}
-                type="button"
                 onClick={() => setActiveId(chat.id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setActiveId(chat.id);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
                 className={`w-full rounded-xl border p-3 text-left ${
                   chat.id === activeId
                     ? isDark
@@ -295,7 +468,7 @@ export default function Page() {
                     <Trash2 size={14} />
                   </Button>
                 </div>
-              </button>
+              </div>
             ))}
           </CardContent>
         </Card>
@@ -316,6 +489,26 @@ export default function Page() {
               <p className={`text-xs ${isDark ? "text-fuchsia-200/80" : "text-fuchsia-700/80"}`}>
                 {apiStatus}
               </p>
+              <p className={`text-xs ${isDark ? "text-fuchsia-300/70" : "text-fuchsia-700/70"}`}>
+                Канал статусов:
+                <span
+                  className={`ml-1 inline-flex rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                    statusChannel === "sse + polling fallback"
+                      ? isDark
+                        ? "bg-amber-900/40 text-amber-200"
+                        : "bg-amber-100 text-amber-700"
+                      : statusChannel === "sse"
+                        ? isDark
+                          ? "bg-emerald-900/40 text-emerald-200"
+                          : "bg-emerald-100 text-emerald-700"
+                        : isDark
+                          ? "bg-slate-800 text-slate-200"
+                          : "bg-slate-100 text-slate-700"
+                  }`}
+                >
+                  {channelLabel}
+                </span>
+              </p>
               <div>
                 <label className="mb-1 block text-sm font-medium">Запрос</label>
                 <Textarea
@@ -334,24 +527,6 @@ export default function Page() {
                   placeholder="Например: напиши функцию максимума"
                 />
               </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium">Контекст (Lua)</label>
-                <Textarea
-                  className={
-                    isDark
-                      ? "border-fuchsia-800 bg-zinc-900 text-fuchsia-50 placeholder:text-fuchsia-300/80"
-                      : ""
-                  }
-                  value={activeChat.draftContext}
-                  onChange={(e) =>
-                    patchActiveChat((chat) => ({
-                      ...chat,
-                      draftContext: e.target.value,
-                    }))
-                  }
-                  placeholder="Опционально: текущий Lua-код для доработки"
-                />
-              </div>
               <div className="flex items-center gap-2">
                 <Button onClick={onSubmit} disabled={loading}>
                   {loading ? (
@@ -366,7 +541,10 @@ export default function Page() {
                 {loading ? (
                   <Button
                     variant="outline"
-                    onClick={() => abortController?.abort()}
+                    onClick={() => {
+                      uiDebug("submit:cancel_click");
+                      abortController?.abort();
+                    }}
                   >
                     Отменить
                   </Button>
@@ -378,19 +556,103 @@ export default function Page() {
             </CardContent>
           </Card>
 
+          {DEBUG_UI && lastWirePayload ? (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">Отладка: тело последнего POST /generate</CardTitle>
+                <p className={`text-xs font-normal ${isDark ? "text-fuchsia-200/80" : "text-fuchsia-700/80"}`}>
+                  Сравните 1-й и 2-й запрос после двух отправок. В консоли браузера смотрите фильтр{" "}
+                  <code className="rounded bg-black/10 px-1">[API DEBUG] generate:wire_payload</code> — там те же
+                  поля, что в <code className="rounded bg-black/10 px-1">JSON.stringify</code> у fetch.
+                </p>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className={`text-xs ${isDark ? "text-fuchsia-300/80" : "text-fuchsia-700/80"}`}>
+                  Время: {nowRu(lastWirePayload.at)}
+                </p>
+                <div>
+                  <div className="mb-1 flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">prompt</span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={() => {
+                        void navigator.clipboard?.writeText(lastWirePayload.prompt ?? "");
+                      }}
+                    >
+                      Копировать prompt
+                    </Button>
+                  </div>
+                  <pre
+                    className={`max-h-40 overflow-auto whitespace-pre-wrap rounded-lg border p-2 text-xs ${
+                      isDark ? "border-fuchsia-800 bg-zinc-950 text-fuchsia-100" : "border-fuchsia-200 bg-white"
+                    }`}
+                  >
+                    {lastWirePayload.prompt}
+                  </pre>
+                </div>
+                <div>
+                  <div className="mb-1 flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">context</span>
+                    <span className={`text-xs ${isDark ? "text-fuchsia-300/70" : "text-fuchsia-600"}`}>
+                      ({(lastWirePayload.context || "").length} симв.)
+                    </span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={() => {
+                        void navigator.clipboard?.writeText(lastWirePayload.context ?? "");
+                      }}
+                    >
+                      Копировать context
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={() => {
+                        void navigator.clipboard?.writeText(
+                          JSON.stringify({ prompt: lastWirePayload.prompt, context: lastWirePayload.context })
+                        );
+                      }}
+                    >
+                      Копировать JSON целиком
+                    </Button>
+                  </div>
+                  <pre
+                    className={`max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border p-2 text-xs ${
+                      isDark ? "border-fuchsia-800 bg-zinc-950 text-fuchsia-100" : "border-fuchsia-200 bg-white"
+                    }`}
+                  >
+                    {lastWirePayload.context === "" ? "«пустая строка»" : lastWirePayload.context}
+                  </pre>
+                </div>
+              </CardContent>
+            </Card>
+          ) : null}
+
           <Card>
             <CardHeader>
               <CardTitle>Этапы выполнения</CardTitle>
             </CardHeader>
             <CardContent>
+              <div className="mb-3 h-2 w-full overflow-hidden rounded-full bg-fuchsia-200/60">
+                <div
+                  className="h-full bg-gradient-to-r from-red-500 to-fuchsia-600 transition-all duration-300"
+                  style={{ width: `${Math.max(derivedProgress, timeline.length ? 8 : 0)}%` }}
+                />
+              </div>
+              <p className={`mb-3 text-xs ${isDark ? "text-fuchsia-200/80" : "text-fuchsia-700/80"}`}>
+                Текущий этап: {currentPhase ? STATUS_LABELS[currentPhase] || currentPhase : "Ожидание запуска"}
+              </p>
               <div className="flex flex-wrap gap-2">
-                {[
-                  { key: "pending", label: "Ожидание" },
-                  { key: "generating", label: "Генерация" },
-                  { key: "validating", label: "Проверка" },
-                  { key: "done", label: "Готово" },
-                ].map((step) => {
-                  const active = timeline.includes(step.key);
+                {STATUS_STEPS.map((step) => {
+                  const active = completedPhases.has(step.key);
                   return (
                     <span
                       key={step.key}
@@ -450,6 +712,15 @@ export default function Page() {
                       >
                         LocalScript
                       </p>
+                      {m.assistantText ? (
+                        <p
+                          className={`mb-2 whitespace-pre-wrap text-sm ${
+                            isDark ? "text-fuchsia-100" : "text-fuchsia-900"
+                          }`}
+                        >
+                          {m.assistantText}
+                        </p>
+                      ) : null}
                       {m.status === "pending" ? (
                         <p className={`text-sm ${isDark ? "text-fuchsia-200" : "text-fuchsia-700"}`}>
                           Генерация...
