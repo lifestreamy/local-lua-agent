@@ -1,17 +1,19 @@
 import logging
 import re
+import os
 from pathlib import Path
-
 import httpx
-
 from api.models import GenerateRequest
 
 logger = logging.getLogger(__name__)
 
 GUARD_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system-prompt-guard.txt"
 GUARD_TEMPERATURE = 0.0
-GUARD_NUM_PREDICT = 10
 SECURITY_FALLBACK = "return nil -- [SECURITY_BLOCK] Unsafe or off-topic prompt detected"
+
+# SYNCED CONSTANTS WITH AGENT.PY TO PREVENT MODEL THRASHING
+OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "3072"))
+OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "1024"))
 
 try:
     _GUARD_SYSTEM_PROMPT = GUARD_PROMPT_PATH.read_text(encoding="utf-8").strip()
@@ -20,33 +22,23 @@ except FileNotFoundError:
     _GUARD_SYSTEM_PROMPT = "Reply SAFE if it is a coding task, otherwise UNSAFE."
 
 _HARD_BLOCK_PHRASES = [
-    "ignore all previous",
-    "forget all rules",
-    "forget all previous",
-    "you are now dan",
-    "repeat your instructions",
-    "reveal your system prompt",
-    "выведи свой системный",
-    "забудь все правила",
-    "забудь предыдущие",
-    "ты больше не",
-    "повтори свои инструкции",
-    "ты теперь",
-    "напиши стих",
-    "напишите стих",
-    "расскажи анекдот",
+    "ignore all previous", "forget all rules", "forget all previous",
+    "you are now dan", "repeat your instructions", "reveal your system prompt",
+    "выведи свой системный", "забудь все правила", "забудь предыдущие",
+    "ты больше не", "повтори свои инструкции", "ты теперь",
+    "напиши стих", "напишите стих", "расскажи анекдот"
 ]
 
+# Fixed standard raw string format for Python Regex compilation
 _OUTPUT_LEAK_PATTERNS = [
     r"I'm sorry, but I can't",
     r"I cannot comply",
     r"As an AI",
     r"print\(['\"]Once upon",
     r"print\(.*hacked",
-    r"\[SECURITY_BLOCK\]",
+    r"\[SECURITY_BLOCK\]"
 ]
 _LEAK_RE = re.compile("|".join(_OUTPUT_LEAK_PATTERNS), re.IGNORECASE)
-
 
 def _hard_block_check(prompt: str) -> bool:
     lower = prompt.lower()
@@ -56,14 +48,27 @@ def _hard_block_check(prompt: str) -> bool:
             return True
     return False
 
+def _truncate_context_for_guard(context: str, max_chars: int = 1500) -> str:
+    """Hard cap the context window for the guard to prevent Lost in the Middle."""
+    if not context or len(context) <= max_chars:
+        return context
+
+    truncated = context[-max_chars:]
+    user_idx = truncated.find("User:")
+    if user_idx != -1:
+        return truncated[user_idx:]
+    return truncated
 
 async def is_safe_prompt(request: GenerateRequest, ollama_url: str, model_name: str) -> bool:
     if _hard_block_check(request.prompt):
         return False
 
+    safe_context = _truncate_context_for_guard(request.context, max_chars=1500)
+
     full_input = ""
-    if request.context:
-        full_input += f"<chat_history>\n{request.context}\n</chat_history>\n\n"
+    if safe_context:
+        full_input += f"<chat_history>\n{safe_context}\n</chat_history>\n\n"
+
     full_input += f"<user_input>\n{request.prompt}\n</user_input>"
 
     payload = {
@@ -74,9 +79,10 @@ async def is_safe_prompt(request: GenerateRequest, ollama_url: str, model_name: 
         ],
         "stream": False,
         "options": {
-            "temperature": GUARD_TEMPERATURE,
-            "num_predict": GUARD_NUM_PREDICT,
-        },
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_predict": OLLAMA_NUM_PREDICT,
+            "temperature": GUARD_TEMPERATURE
+        }
     }
 
     try:
@@ -85,7 +91,7 @@ async def is_safe_prompt(request: GenerateRequest, ollama_url: str, model_name: 
             resp.raise_for_status()
 
             raw = resp.json().get("message", {}).get("content", "")
-            normalized = re.sub(r"[^a-zA-Z]", "", raw).upper()
+            normalized = re.sub(r'[^a-zA-Z]', '', raw).upper()
 
             if normalized == "SAFE":
                 is_safe = True
@@ -94,16 +100,12 @@ async def is_safe_prompt(request: GenerateRequest, ollama_url: str, model_name: 
             else:
                 is_safe = False
 
-            logger.info("Guard raw=%r normalized=%r verdict=%s", raw, normalized, is_safe)
             return is_safe
-
     except Exception as exc:
         logger.error("Guard check failed. Error: %s", exc)
         return True
 
-
 def sanitize_output(code: str) -> str:
     if _LEAK_RE.search(code):
-        logger.warning("GUARD sanitize: output leak detected, replacing with fallback")
         return SECURITY_FALLBACK
     return code
