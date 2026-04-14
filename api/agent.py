@@ -1,30 +1,44 @@
 """
-api/agent.py — AgentPipeline: orchestrates OllamaClient, PromptBuilder, LuaValidator.
+api/agent.py — Ollama client and AgentPipeline.
 
-Model warm-up is handled by main.py at startup (lifespan event).
-This module focuses only on generation + validation + retry loop.
+Pipeline steps:
+1. Build prompt (system_prompt + optional context + user task).
+2. POST to Ollama /api/generate.
+3. Extract Lua from <code>...</code> section of the response.
+4. Validate with luac.
+5. If invalid and retries remain → rebuild prompt with error context, go to 2.
+6. After MAX_RETRIES failures → return best attempt.
+
+Response format expected from LLM:
+<thinking>
+  ...reasoning...
+</thinking>
+<code>
+  ...raw lua code...
+</code>
 """
 
 import logging
 import os
 import re
-import time
 
 import httpx
 
+from api.models import GenerateRequest
 from api.prompt_builder import PromptBuilder
 from api.validator import LuaValidator
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
 MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
 
 OLLAMA_OPTIONS: dict = {
     "num_ctx": 4096,
     "num_predict": 512,
-    "temperature": 0.1,
+    "temperature": 0.1, # если условия требуют точное совпадение, поставить 0.0
+    "seed": 42, # для воспроизводимости (температура 0 + seed = максимальный детерминизм)
 }
 
 
@@ -35,45 +49,7 @@ class OllamaClient:
         self.base_url = base_url.rstrip("/")
         self.model = model
 
-    def warm_up(self, max_wait: int = 60) -> None:
-        """
-        Block until Ollama has the model loaded in VRAM.
-        Called ONCE at startup by main.py lifespan — NOT per request.
-
-        Polls /api/generate with a 1-token request every 3 seconds.
-        Gives up after max_wait seconds and logs a warning.
-        """
-        url = f"{self.base_url}/api/generate"
-        payload = {
-            "model": self.model,
-            "prompt": "hi",
-            "stream": False,
-            "options": {"num_ctx": 512, "num_predict": 1},
-        }
-        deadline = time.time() + max_wait
-        attempt = 0
-        while time.time() < deadline:
-            attempt += 1
-            try:
-                logger.info("Warm-up ping %d (waiting for model to load into VRAM)...", attempt)
-                r = httpx.post(url, json=payload, timeout=30.0)
-                if r.status_code == 200:
-                    logger.info("Ollama model loaded successfully after %d ping(s).", attempt)
-                    return
-                logger.warning("Ping %d: Ollama returned %d, retrying in 3s...", attempt, r.status_code)
-            except httpx.HTTPError as exc:
-                logger.warning("Ping %d: connection error (%s), retrying in 3s...", attempt, exc)
-            time.sleep(3)
-        logger.warning(
-            "Warm-up gave up after %ds. Model may not be loaded. "
-            "First real request will trigger load (may be slow).", max_wait
-        )
-
     def generate(self, prompt: str) -> str:
-        """
-        Send prompt to Ollama and return raw response text.
-        Model is expected to already be in VRAM (warm_up called at startup).
-        """
         url = f"{self.base_url}/api/generate"
         payload = {
             "model": self.model,
@@ -81,8 +57,8 @@ class OllamaClient:
             "stream": False,
             "options": OLLAMA_OPTIONS,
         }
-        logger.debug("POST %s prompt_len=%d", url, len(prompt))
-        response = httpx.post(url, json=payload, timeout=120.0)
+        logger.debug("POST %s model=%s prompt_len=%d", url, self.model, len(prompt))
+        response = httpx.post(url, json=payload, timeout=60.0)
         response.raise_for_status()
         return response.json().get("response", "")
 
@@ -90,19 +66,34 @@ class OllamaClient:
 def _extract_lua_code(raw: str) -> str:
     """
     Extract Lua code from the LLM response.
-    Priority: <code>...</code> → markdown fences → raw string.
+
+    Priority:
+    1. Parse <code>...</code> tag (our primary CoT format).
+    2. Strip markdown fences ```lua...``` as fallback (model disobedience).
+    3. Return the entire raw string stripped as last resort.
     """
+    # Primary: <code>...</code>
     code_tag = re.search(r"<code>(.*?)</code>", raw, re.DOTALL | re.IGNORECASE)
     if code_tag:
         return code_tag.group(1).strip()
+
+    # Fallback 1: ```lua ... ``` or ``` ... ```
     fenced = re.search(r"```(?:lua)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
     if fenced:
         return fenced.group(1).strip()
+
+    # Fallback 2: raw string (model ignored all formatting)
     return raw.strip()
 
 
 class AgentPipeline:
-    """Orchestrates the full generate → validate → fix loop."""
+    """
+    Оркестратор полного цикла: генерация → валидация → исправление.
+
+    Принимает GenerateRequest с полями prompt и опциональным context.
+    Передаёт оба поля в PromptBuilder, который формирует финальный промпт.
+    Повторяет попытки до MAX_RETRIES, передавая ошибку luac обратно в модель.
+    """
 
     def __init__(
             self,
@@ -114,17 +105,35 @@ class AgentPipeline:
         self.builder = prompt_builder or PromptBuilder()
         self.validator = validator or LuaValidator()
 
-    def generate(self, user_query: str) -> str:
+    def generate(self, request: GenerateRequest) -> str:
         """
-        Generate valid Lua code for the given natural language query.
-        Returns best Lua code string within MAX_RETRIES attempts.
+        Генерирует валидный Lua-код по запросу пользователя.
+
+        Аргументы:
+            request: Pydantic-модель с полями:
+                     - prompt  (обязательно) — текст задачи на естественном языке
+                     - context (опционально) — существующий Lua-код для доработки
+
+        Возвращает:
+            Строку Lua-кода — либо синтаксически валидную, либо лучший вариант
+            из всех попыток, если ни одна не прошла валидацию.
         """
         error_context: str | None = None
         best_code: str = ""
 
         for attempt in range(1, MAX_RETRIES + 1):
-            logger.info("Attempt %d/%d | query=%r", attempt, MAX_RETRIES, user_query[:60])
-            prompt = self.builder.build(user_query, error_context=error_context)
+            logger.info(
+                "Attempt %d/%d | prompt=%r | has_context=%s",
+                attempt, MAX_RETRIES,
+                request.prompt[:60],
+                bool(request.context),
+            )
+
+            prompt = self.builder.build(
+                prompt=request.prompt,
+                context=request.context,
+                error_context=error_context,
+            )
 
             try:
                 raw_response = self.ollama.generate(prompt)
@@ -134,10 +143,12 @@ class AgentPipeline:
                 continue
 
             code = _extract_lua_code(raw_response)
+
             if not best_code:
                 best_code = code
 
             is_valid, lua_error = self.validator.validate(code)
+
             if is_valid:
                 logger.info("Valid Lua on attempt %d.", attempt)
                 return code

@@ -1,45 +1,69 @@
 # docker-compose.yml — LocalScript: two services
 #   api    — FastAPI app (this repo, port 8080)
-#   ollama — Ollama server with pre-pulled model (port 11434)
+#   ollama — Ollama server with auto model pull (port 11434)
 #
-# Launch: docker-compose up --build
-# Test:   curl -X POST http://localhost:8080/generate \
-#              -H "Content-Type: application/json" \
-#              -d '{"prompt": "get last email from list"}'
-
-version: "3.9"
+# First launch:  docker-compose up --build
+# Subsequent:    docker-compose up
+# Test:          curl -X POST http://localhost:8080/generate \
+#                     -H "Content-Type: application/json" \
+#                     -d '{"prompt": "get last email from list"}'
 
 services:
-  api:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      # Ollama reachable at service name "ollama" inside Docker network
-      OLLAMA_BASE_URL: "http://ollama:11434"
-      OLLAMA_MODEL: "qwen2.5-coder:7b-instruct-q4_K_M"
-      MAX_RETRIES: "3"
-      # Set DRY_RUN=true here if you want to skip luac during Docker testing
-      DRY_RUN: "false"
-    depends_on:
-      - ollama
-    restart: on-failure
-
   ollama:
     image: ollama/ollama:latest
     ports:
       - "11434:11434"
     volumes:
-      # Persist downloaded models — avoids re-pulling on every docker-compose up
       - ollama_data:/root/.ollama
     # GPU passthrough — comment out if no NVIDIA GPU available
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              count: all
+#              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  model-puller:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: >
+      sh -c "
+        echo 'Waiting for Ollama to be ready...';
+        until ollama list > /dev/null 2>&1; do sleep 3; done;
+        echo 'Pulling model qwen2.5-coder:7b-instruct-q4_K_M...';
+        ollama pull qwen2.5-coder:7b-instruct-q4_K_M;
+        echo 'Model ready.'
+      "
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: on-failure
+
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      OLLAMA_MODEL: "qwen2.5-coder:7b-instruct-q4_K_M"
+      MAX_RETRIES: "3"
+      DRY_RUN: "false"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      model-puller:
+        condition: service_completed_successfully
+    restart: on-failure
 
 volumes:
   ollama_data:
