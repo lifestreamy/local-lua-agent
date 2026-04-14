@@ -7,6 +7,10 @@ venv/
 env/
 .env
 
+# Python tests reports
+/tests/reports/
+
+
 # JetBrains (PyCharm / IntelliJ)
 .idea/
 # Whitelist shared run configurations
@@ -26,3 +30,4 @@ env/
 # OS Files
 .DS_Store
 Thumbs.db
+
