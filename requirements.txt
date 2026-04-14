@@ -10,3 +10,6 @@ uvicorn[standard]==0.44.0
 pydantic==2.12.5
 # httpx: https://pypi.org/project/httpx/ (latest 0.28.1)
 httpx==0.28.1
+# for SSE streaming for model status, to cli client and web ui
+# https://pypi.org/project/sse-starlette/
+sse-starlette==3.3.4
