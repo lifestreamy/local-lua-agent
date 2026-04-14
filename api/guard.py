@@ -17,9 +17,8 @@ logger = logging.getLogger(__name__)
 
 GUARD_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system-prompt-guard.txt"
 
-# Hardcoded constants reverted since config.py is removed
 GUARD_TEMPERATURE = 0.0
-GUARD_NUM_PREDICT = 5
+GUARD_NUM_PREDICT = 10
 SECURITY_FALLBACK = "return nil -- [SECURITY_BLOCK] Unsafe or off-topic prompt detected"
 
 try:
@@ -102,16 +101,26 @@ async def is_safe_prompt(
             resp = await client.post(f"{ollama_url}/api/chat", json=payload)
             resp.raise_for_status()
 
-            raw = resp.json().get("message", {}).get("content", "").strip().upper()
+            raw = resp.json().get("message", {}).get("content", "")
 
-            if "UNSAFE" in raw:
-                is_safe = False
-            elif "SAFE" in raw:
+            # Alina & Cursor's strict normalization recommendation
+            normalized = re.sub(r'[^a-zA-Z]', '', raw).upper()
+
+            if normalized == "SAFE":
                 is_safe = True
-            else:
+            elif normalized == "UNSAFE":
                 is_safe = False
+            else:
+                # If it's a chatty model that output something like "This request is SAFE"
+                # We do a secondary check to prevent false blocking, but keeping it strict.
+                if "UNSAFE" in normalized:
+                    is_safe = False
+                elif "SAFE" in normalized:
+                    is_safe = True
+                else:
+                    is_safe = False # fail-closed
 
-            logger.info("Guard verdict for %r: %s (raw=%r)", request.prompt[:60], "SAFE" if is_safe else "UNSAFE", raw)
+            logger.info("Guard raw=%r normalized=%r verdict=%s", raw, normalized, is_safe)
             return is_safe
 
     except Exception as exc:
