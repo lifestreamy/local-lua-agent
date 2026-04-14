@@ -1,9 +1,9 @@
-# API Contract — LocalScript (v2 — Async SSE & Single Prompt)
+# API Contract — LocalScript (v3 — Async SSE & Conversational Messages)
 
 > Расположение в репозитории: `docs/api_contract_description.md`
 
 Этот документ описывает HTTP API сервиса **LocalScript** — локального агента для генерации Lua-кода.
-**ВНИМАНИЕ:** API переведено на асинхронную модель с Server-Sent Events (SSE).
+**ВНИМАНИЕ:** API переведено на асинхронную модель с Server-Sent Events (SSE). Агент теперь может не только выдавать код, но и вести диалог (задавать уточняющие вопросы).
 
 ***
 
@@ -69,23 +69,29 @@ Accept: text/event-stream
 
 #### Ответ (HTTP 200 OK — Stream)
 
-Стримит JSON-объекты со следующей структурой:
+Стримит JSON-объекты. Теперь включает поле `message` для текстовых ответов или вопросов от LLM.
 
+**Пример 1: Успешная генерация кода с пояснением от модели**
 ```json
-data: {"stage": "pending", "code": "", "error": ""}
+data: {"stage": "pending", "message": "", "code": "", "error": ""}
+data: {"stage": "generating", "message": "Я понял задачу. Использую _utils.array.new().", "code": "", "error": ""}
+data: {"stage": "validating", "message": "", "code": "", "error": ""}
+data: {"stage": "done", "message": "Вот исправленный код:", "code": "local r = _utils.array.new()\nreturn r", "error": ""}
+```
 
-data: {"stage": "generating", "code": "", "error": ""}
-
-data: {"stage": "validating", "code": "", "error": ""}
-
-data: {"stage": "done", "code": "local r = _utils.array.new()\nreturn r", "error": ""}
+**Пример 2: Агент задает уточняющий вопрос (Clarification Loop)**
+Если промпт непонятен, агент не генерирует код, а спрашивает детали. В этом случае `code` будет пустым.
+```json
+data: {"stage": "pending", "message": "", "code": "", "error": ""}
+data: {"stage": "generating", "message": "", "code": "", "error": ""}
+data: {"stage": "done", "message": "Уточните, пожалуйста: фильтровать только активные заказы или вообще все?", "code": "", "error": ""}
 ```
 
 ***
 
 ### 3. `GET /health`
 
-Проверка доступности сервиса.
+Проверка доступности сервиса. (В будущем будет дополнено статусом модели и GPU для баллов).
 
 ```http
 GET /health
