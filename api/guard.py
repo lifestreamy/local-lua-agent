@@ -1,10 +1,3 @@
-"""
-api/guard.py — Prompt injection and off-topic guard.
-
-Reads the guard instructions from prompts/system-prompt-guard.txt.
-Uses the LLM (temperature=0) to classify incoming prompts BEFORE generation.
-"""
-
 import logging
 import re
 from pathlib import Path
@@ -16,7 +9,6 @@ from api.models import GenerateRequest
 logger = logging.getLogger(__name__)
 
 GUARD_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system-prompt-guard.txt"
-
 GUARD_TEMPERATURE = 0.0
 GUARD_NUM_PREDICT = 10
 SECURITY_FALLBACK = "return nil -- [SECURITY_BLOCK] Unsafe or off-topic prompt detected"
@@ -46,18 +38,12 @@ _HARD_BLOCK_PHRASES = [
 ]
 
 _OUTPUT_LEAK_PATTERNS = [
-    r"I\'m sorry, but I can\'t",
+    r"I'm sorry, but I can't",
     r"I cannot comply",
     r"As an AI",
-    r"print\([\"']Once upon",
-    r"print\([\"']Lua, oh Lua",
-    r"\[\[\s*Lua, oh Lua",
+    r"print\(['\"]Once upon",
     r"print\(.*hacked",
-    r"return\s+[\"']Donald",
-    r"return\s+[\"']The user asked",
-    r"You are Qwen",
-    r"Alibaba Cloud",
-    r"Bonjour le monde",
+    r"\[SECURITY_BLOCK\]",
 ]
 _LEAK_RE = re.compile("|".join(_OUTPUT_LEAK_PATTERNS), re.IGNORECASE)
 
@@ -71,17 +57,14 @@ def _hard_block_check(prompt: str) -> bool:
     return False
 
 
-async def is_safe_prompt(
-        request: GenerateRequest,
-        ollama_url: str,
-        model_name: str,
-) -> bool:
+async def is_safe_prompt(request: GenerateRequest, ollama_url: str, model_name: str) -> bool:
     if _hard_block_check(request.prompt):
         return False
 
-    full_input = f"<user_input>\n{request.prompt}\n</user_input>"
+    full_input = ""
     if request.context:
-        full_input += f"\n\n[EXISTING CODE]:\n{request.context}"
+        full_input += f"<chat_history>\n{request.context}\n</chat_history>\n\n"
+    full_input += f"<user_input>\n{request.prompt}\n</user_input>"
 
     payload = {
         "model": model_name,
@@ -102,29 +85,20 @@ async def is_safe_prompt(
             resp.raise_for_status()
 
             raw = resp.json().get("message", {}).get("content", "")
-
-            # Alina & Cursor's strict normalization recommendation
-            normalized = re.sub(r'[^a-zA-Z]', '', raw).upper()
+            normalized = re.sub(r"[^a-zA-Z]", "", raw).upper()
 
             if normalized == "SAFE":
                 is_safe = True
             elif normalized == "UNSAFE":
                 is_safe = False
             else:
-                # If it's a chatty model that output something like "This request is SAFE"
-                # We do a secondary check to prevent false blocking, but keeping it strict.
-                if "UNSAFE" in normalized:
-                    is_safe = False
-                elif "SAFE" in normalized:
-                    is_safe = True
-                else:
-                    is_safe = False # fail-closed
+                is_safe = False
 
             logger.info("Guard raw=%r normalized=%r verdict=%s", raw, normalized, is_safe)
             return is_safe
 
     except Exception as exc:
-        logger.error("Guard check failed (fail-open). Error: %s", exc)
+        logger.error("Guard check failed. Error: %s", exc)
         return True
 
 
