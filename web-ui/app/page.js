@@ -169,10 +169,23 @@ export default function Page() {
     return () => clearInterval(timer);
   }, []);
 
-  const activeChat = useMemo(() => {
-    if (!state) return null;
-    return state.chats.find((c) => c.id === activeId) || state.chats[0] || null;
+  const resolvedActiveId = useMemo(() => {
+    if (!state?.chats?.length) return null;
+    if (activeId && state.chats.some((c) => c.id === activeId)) return activeId;
+    return state.chats[0].id;
   }, [state, activeId]);
+
+  const activeChat = useMemo(() => {
+    if (!state || !resolvedActiveId) return null;
+    return state.chats.find((c) => c.id === resolvedActiveId) || null;
+  }, [state, resolvedActiveId]);
+
+  useEffect(() => {
+    if (!resolvedActiveId) return;
+    if (activeId !== resolvedActiveId) {
+      setActiveId(resolvedActiveId);
+    }
+  }, [activeId, resolvedActiveId]);
 
   const sortedChats = useMemo(() => {
     if (!state) return [];
@@ -182,10 +195,13 @@ export default function Page() {
   function patchActiveChat(patcher) {
     setState((prev) => {
       if (!prev) return prev;
+      const targetId =
+        prev.chats.some((chat) => chat.id === activeId) ? activeId : prev.chats[0]?.id;
+      if (!targetId) return prev;
       return {
         ...prev,
         chats: prev.chats.map((chat) =>
-          chat.id === activeId ? patcher(chat) : chat
+          chat.id === targetId ? patcher(chat) : chat
         ),
       };
     });
@@ -526,6 +542,12 @@ export default function Page() {
                       draftPrompt: e.target.value,
                     }))
                   }
+                  onKeyDown={(e) => {
+                    if (e.key !== "Enter" || e.shiftKey) return;
+                    if (e.nativeEvent.isComposing || loading) return;
+                    e.preventDefault();
+                    onSubmit();
+                  }}
                   placeholder="Например: напиши функцию максимума"
                 />
               </div>
