@@ -25,8 +25,12 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
+.theme-light .ls-card {
+  border-color: rgba(167, 139, 250, 0.45);
+}
+
 .theme-dark .ls-card {
-  background: rgba(24, 24, 32, 0.9);
-  border-color: rgba(168, 85, 247, 0.35);
-  color: #f5e9ff;
+  background: rgba(30, 27, 45, 0.88);
+  border-color: rgba(139, 92, 246, 0.22);
+  color: #e9d5ff;
 }
