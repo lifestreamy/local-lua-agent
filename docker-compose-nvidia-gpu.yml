@@ -1,5 +1,5 @@
-# docker-compose.yml — Базовая версия (CPU)
-# Безопасный запуск для любой системы.
+# docker-compose-gpu.yml — Версия с аппаратным ускорением (NVIDIA GPU)
+# Использовать только на стендах с установленным Nvidia Container Toolkit.
 services:
   ollama:
     image: ollama/ollama:latest
@@ -7,6 +7,13 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -41,7 +48,7 @@ services:
       OLLAMA_BASE_URL: "http://ollama:11434"
       OLLAMA_MODEL: "qwen2.5-coder:7b-instruct-q4_K_M"
       MAX_RETRIES: "3"
-      DRY_RUN: "false" # Lua 5.5 компилируется прямо в Dockerfile!
+      DRY_RUN: "false"
     depends_on:
       ollama:
         condition: service_healthy
