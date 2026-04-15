@@ -1,27 +1,19 @@
 # Dockerfile — LocalScript API container
 # Base: python:3.11-slim (Debian Bookworm)
-# Installs: Lua 5.5 (Compiled from source) for luac syntax validation
+# Installs: Lua 5.4 for luac syntax validation
 # Runs: uvicorn on port 8080
 
 FROM python:3.11-slim
 
-# Install compilation tools, download Lua 5.5 alpha, compile, and clean up
+# Install Lua 5.4 directly from the Debian repository
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential curl libreadline-dev && \
-    curl -R -O https://www.lua.org/work/lua-5.5.0-alpha.tar.gz && \
-    tar -zxf lua-5.5.0-alpha.tar.gz && \
-    cd lua-5.5.0-alpha && \
-    make linux test && \
-    make install && \
-    cd .. && \
-    rm -rf lua-5.5.0-alpha lua-5.5.0-alpha.tar.gz && \
-    apt-get purge -y build-essential curl && \
-    apt-get autoremove -y && \
+    apt-get install -y --no-install-recommends lua5.4 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Symlink the compiled Lua 5.5 to luac5.5 so our validator finds it instantly
-RUN ln -sf /usr/local/bin/luac /usr/local/bin/luac5.5
+# Symlink the binary so your Python validator can call `luac` or `luac5.4` seamlessly
+RUN ln -sf /usr/bin/luac5.4 /usr/local/bin/luac && \
+    ln -sf /usr/bin/luac5.4 /usr/local/bin/luac5.5
 
 WORKDIR /app
 
