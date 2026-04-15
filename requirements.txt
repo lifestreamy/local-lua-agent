@@ -4,12 +4,22 @@
 
 # fastapi: https://pypi.org/project/fastapi/ (latest 0.135.3)
 fastapi==0.135.3
+
 # uvicorn: https://pypi.org/project/uvicorn/ (latest 0.44.0)
 uvicorn[standard]==0.44.0
+
 # pydantic: https://pypi.org/project/pydantic/ (latest 2.12.5)
 pydantic==2.12.5
+
 # httpx: https://pypi.org/project/httpx/ (latest 0.28.1)
 httpx==0.28.1
+
 # for SSE streaming for model status, to cli client and web ui
 # https://pypi.org/project/sse-starlette/
 sse-starlette==3.3.4
+
+# for the rich CLI client application
+rich>=13.0.0
+
+# for the CLI client command history (up/down arrow keys)
+prompt_toolkit==3.0.52
