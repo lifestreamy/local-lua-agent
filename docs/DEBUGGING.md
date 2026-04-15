@@ -30,7 +30,7 @@
 Быстро менять код Python и перезапускать            → Сценарий B (uvicorn --reload)
 Итерировать по system_prompt.txt без API            → Workflow 1 (Raw Ollama)
 Отлаживать сборку промпта в Python                  → Workflow 2 (Python-скрипт)
-Проверить полный пайплайн один запрос               → Workflow 3 (curl / PS к /generate)
+Проверить полный пайплайн (async)                    → Workflow 3 (`POST /generate` + SSE `/status` или `python tests/test_sse.py`)
 Измерить точность на всём тест-сете                 → Workflow 4 (unittest runner)
 ```
 
@@ -60,28 +60,34 @@ docker-compose up --build
 
 ### 2.3 Проверка — curl (Linux / macOS / Git Bash)
 
+API **асинхронный**: `POST /generate` возвращает только `{"task_id":"..."}`; готовый Lua приходит в потоке **SSE** на `GET /status?task_id=...` (события с JSON, у завершения обычно `stage":"done"` и поле `code`).
+
 ```bash
-# Базовый запрос:
-curl -X POST http://localhost:8080/generate \
+# 1) Отправить задачу:
+curl -sS -X POST http://localhost:8080/generate \
      -H "Content-Type: application/json" \
      -d '{"prompt": "получить последний email из списка"}'
+# Ожидаемый ответ: {"task_id":"<uuid>"}
 
-# Ожидаемый ответ:
-# {"code":"return wf.vars.emails[#wf.vars.emails]"}
+# 2) Подставь task_id из шага 1 и слушай SSE до done/error:
+curl -sN "http://localhost:8080/status?task_id=<uuid>"
 
-# Health check:
-curl http://localhost:8080/health
-# {"status":"ok"}
+# Health (проверка API и связи с Ollama/моделью):
+curl -sS http://localhost:8080/health
 ```
+
+Проще всего прогнать весь цикл одной командой: **`python tests/test_sse.py`** (сервер должен быть запущен).
 
 ### 2.4 Проверка — PowerShell 7+ (pwsh)
 
+`POST /generate` через `Invoke-RestMethod` удобен; для **SSE** на Windows надёжнее **curl** из Git Bash / WSL или скрипт `python tests/test_sse.py`.
+
 ```powershell
-# PS 7+ отправляет UTF-8 по умолчанию — работает напрямую:
 Invoke-RestMethod -Uri http://localhost:8080/generate `
     -Method POST `
     -ContentType "application/json; charset=utf-8" `
     -Body '{"prompt": "получить последний email из списка"}'
+# Ожидается объект с полем task_id
 ```
 
 ### 2.5 Проверка — PowerShell 5.1 (встроенный в Windows)
@@ -94,6 +100,7 @@ Invoke-RestMethod -Uri http://localhost:8080/generate `
     -Method POST `
     -ContentType "application/json; charset=utf-8" `
     -Body $bytes
+# Ответ: task_id; для полного пайплайна — curl SSE или python tests/test_sse.py
 ```
 
 ### 2.6 Остановка
@@ -122,15 +129,25 @@ ollama serve
 > **Важно:** Запускай Ollama через CLI (`ollama serve`), а не через GUI-приложение.
 > GUI не позволяет задать переменные среды.
 
-### 3.2 Проверка Ollama (любой другой терминал)
+### 3.2 Скачать модель и проверить Ollama (любой другой терминал)
+
+Один раз на машину (пока работает `ollama serve`):
 
 ```powershell
-# Проверить что Ollama отвечает (простой английский запрос — PS 5.1 и так справится):
-Invoke-RestMethod -Uri http://localhost:11434/api/generate -Method POST `
+ollama pull qwen2.5-coder:7b-instruct-q4_K_M
+# или легче для CPU:
+ollama pull qwen2.5-coder:0.5b
+```
+
+Для «живого» диалога с моделью без FastAPI: **`ollama run qwen2.5-coder:0.5b`** (или другое скачанное имя).
+
+Проверка, что Ollama отвечает (подставь имя модели, совпадающее с будущим `OLLAMA_MODEL`):
+
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:11434/api/generate -Method POST `
     -ContentType "application/json" `
     -Body '{"model":"qwen2.5-coder:7b-instruct-q4_K_M","prompt":"hello","stream":false}'
-
-# Ожидаемый ответ: объект с полем response = "Hello! How can I assist you today?"
+# Ожидаемый ответ: объект с полем response
 ```
 
 ### 3.3 Терминал 2 — Запуск uvicorn
@@ -140,35 +157,42 @@ Invoke-RestMethod -Uri http://localhost:11434/api/generate -Method POST `
 .venv\Scripts\activate
 
 # Настроить переменные среды:
-$env:NO_PROXY        = "localhost,127.0.0.1,::1"  # обойти системный прокси
-$env:DRY_RUN         = "true"                      # пропустить luac (нет на Windows)
-$env:OLLAMA_BASE_URL = "http://localhost:11434"
-$env:OLLAMA_MODEL    = "qwen2.5-coder:7b-instruct-q4_K_M"
-$env:MAX_RETRIES     = "3"
+$env:NO_PROXY           = "localhost,127.0.0.1,::1"  # обойти системный прокси
+$env:DRY_RUN            = "true"                      # пропустить luac (нет на Windows)
+$env:OLLAMA_BASE_URL    = "http://127.0.0.1:11434"
+$env:OLLAMA_MODEL       = "qwen2.5-coder:7b-instruct-q4_K_M"   # или qwen2.5-coder:0.5b
+$env:MAX_RETRIES        = "3"
+$env:OLLAMA_NUM_CTX     = "3072"
+$env:OLLAMA_NUM_PREDICT = "1024"
 
 # Запустить сервер с hot-reload:
-uvicorn api.main:app --reload --port 8080
+uvicorn api.main:app --reload --host 127.0.0.1 --port 8080
 
-# При первом старте warm-up займёт ~10-15 секунд (модель загружается в VRAM).
 # Ждать строки: Application startup complete.
+# Первый запрос к модели после старта Ollama может занять время, пока веса подгрузятся в память.
 ```
 
-### 3.4 Терминал 3 — Тестовые запросы
+### 3.4 Терминал 3 — Тестовые запросы к API (async)
 
-**Через curl (Git Bash / WSL — рекомендуется, всегда UTF-8):**
+`POST /generate` возвращает **`task_id`**. Готовый Lua — в **SSE** `GET /status?task_id=...`. Полный сценарий с командами для Ollama, uvicorn, тестов, CLI и Web UI — в [ONBOARDING.md §12](ONBOARDING.md#12-ручной-локальный-запуск-ollama-модели-uvicorn-тесты-cli-web-ui).
+
+**Через curl (Git Bash / WSL):**
 
 ```bash
-curl -X POST http://localhost:8080/generate \
+curl -sS -X POST http://127.0.0.1:8080/generate \
      -H "Content-Type: application/json" \
      -d '{"prompt": "отфильтровать заказы со статусом выполнен"}'
+# {"task_id":"..."}
+
+curl -sN "http://127.0.0.1:8080/status?task_id=<uuid_из_ответа>"
 ```
 
-**Через PowerShell 5.1 (с явной UTF-8 кодировкой):**
+**Через PowerShell 5.1 (UTF-8 тело) — только шаг submit:**
 
 ```powershell
 $json  = '{"prompt": "отфильтровать заказы со статусом выполнен"}'
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-Invoke-RestMethod -Uri http://localhost:8080/generate `
+Invoke-RestMethod -Uri http://127.0.0.1:8080/generate `
     -Method POST -ContentType "application/json; charset=utf-8" -Body $bytes
 ```
 
@@ -178,18 +202,48 @@ Invoke-RestMethod -Uri http://localhost:8080/generate `
 '{"prompt": "отфильтровать заказы со статусом выполнен"}' | `
     Out-File -Encoding utf8NoBOM body.json
 
-Invoke-RestMethod -Uri http://localhost:8080/generate `
+Invoke-RestMethod -Uri http://127.0.0.1:8080/generate `
     -Method POST -ContentType "application/json; charset=utf-8" -InFile body.json
 ```
 
-**Через Python (самый надёжный способ):**
+**Цикл целиком (рекомендуется):**
 
-```python
-import httpx
-r = httpx.post("http://localhost:8080/generate",
-               json={"prompt": "отфильтровать заказы со статусом выполнен"})
-print(r.json()["code"])
+```powershell
+python tests/test_sse.py
 ```
+
+### 3.5 Тесты, CLI и Web UI (ручная проверка)
+
+**Тесты** (из корня, API для сетевых сценариев должен слушать `:8080`):
+
+```powershell
+python tests/test_sse.py
+python -m unittest tests.test_prompt_injection -v
+python tests/test_session_contract.py
+python tests/test_session_stress.py
+python -m unittest tests.test_request -v
+```
+
+`tests/test_base_cases.py` ожидает в ответе `POST /generate` поле **`code`** (старый контракт); при текущем API с **`task_id`** + SSE этот прогон **не совпадает** с ответом сервера, пока тест не переписан. См. таблицу в ONBOARDING §12.
+
+**CLI-клиент:**
+
+```powershell
+pip install -r requirements.txt
+python cli-client/chat.py
+```
+
+Внутри сессии: обычный текст — запрос; **`exit`** — выход; **`clear`** — сброс накопленного `context`; стрелки — история ввода.
+
+**Web UI:**
+
+```powershell
+cd web-ui
+npm install
+npm run dev
+```
+
+Браузер: `http://localhost:3000`. Если API не на `localhost:8080`, перед `npm run dev`: `$env:NEXT_PUBLIC_API_BASE = "http://127.0.0.1:8080"`.
 
 ---
 
@@ -287,31 +341,45 @@ python debug_prompt.py
 
 ---
 
-### Workflow 3 — Полный пайплайн через API (один запрос)
+### Workflow 3 — Полный пайплайн через API (async)
 
-**Когда использовать:** uvicorn запущен, хочешь проверить конкретный запрос
-через весь стек: PromptBuilder → OllamaClient → CoT-парсер → LuaValidator.
+**Когда использовать:** uvicorn запущен, нужно прогнать запрос через весь стек:
+Guard → PromptBuilder → OllamaClient → CoT-парсер → LuaValidator, с прогрессом по SSE.
 
-```bash
-# curl (Git Bash / WSL):
-curl -sX POST http://localhost:8080/generate \
-     -H "Content-Type: application/json" \
-     -d '{"prompt": "отфильтровать заказы со статусом выполнен"}' | python -m json.tool
-```
+Самый короткий путь: **`python tests/test_sse.py`**.
+
+Пример на **httpx** (одна задача: submit + чтение SSE до `done`/`error`):
 
 ```python
-# Python-скрипт:
+import json
 import httpx
-tasks = [
-    "отфильтровать заказы со статусом выполнен",
-    "оставить только выполненные заказы",
-    "убрать незавершённые заявки",
-]
-for task in tasks:
-    r = httpx.post("http://localhost:8080/generate",
-                   json={"prompt": task}, timeout=60)
-    print(f"Task: {task}")
-    print(f"Code: {r.json().get('code', 'ERROR')}\n")
+
+API = "http://127.0.0.1:8080"
+prompt = "отфильтровать заказы со статусом выполнен"
+
+with httpx.Client(timeout=120.0) as client:
+    r = client.post(f"{API}/generate", json={"prompt": prompt})
+    r.raise_for_status()
+    task_id = r.json()["task_id"]
+
+    with client.stream("GET", f"{API}/status", params={"task_id": task_id}) as stream:
+        stream.raise_for_status()
+        for line in stream.iter_lines():
+            if not line or not line.startswith("data: "):
+                continue
+            payload = json.loads(line.removeprefix("data: "))
+            print(payload.get("stage"), payload.get("message"))
+            if payload.get("stage") in ("done", "error"):
+                print("code:", payload.get("code"))
+                print("error:", payload.get("error"))
+                break
+```
+
+```bash
+# curl: только submit; для SSE подставь task_id вручную:
+curl -sS -X POST http://127.0.0.1:8080/generate \
+     -H "Content-Type: application/json" \
+     -d '{"prompt": "отфильтровать заказы со статусом выполнен"}' | python -m json.tool
 ```
 
 ---
@@ -320,6 +388,8 @@ for task in tasks:
 
 **Когда использовать:** после изменения `system_prompt.txt` — для количественной
 оценки влияния изменений на точность.
+
+**Важно:** `tests/test_base_cases.py` по-прежнему читает поле **`code`** из ответа **`POST /generate`**. Текущий API возвращает **`task_id`** и отдаёт код через **SSE**. Пока тест не обновлён под async, этот workflow **не отражает** продакшн-контракт; для проверки живого API используй Workflow 3 или `python tests/test_sse.py`.
 
 ```bash
 # Убедись что API запущен (Docker или uvicorn), затем:
@@ -390,6 +460,7 @@ Invoke-RestMethod -Uri http://localhost:11434/api/generate `
 '{"prompt": "отфильтровать заказы"}' | Out-File -Encoding utf8NoBOM body.json
 Invoke-RestMethod -Uri http://localhost:8080/generate `
     -Method POST -ContentType "application/json; charset=utf-8" -InFile body.json
+# Ответ содержит task_id; для кода Lua — SSE /status или python tests/test_sse.py
 ```
 
 **Решение 3 — использовать PowerShell 7+:**
@@ -398,6 +469,7 @@ Invoke-RestMethod -Uri http://localhost:8080/generate `
 # Установить: winget install Microsoft.PowerShell
 # Запустить: pwsh (не powershell)
 pwsh -Command 'Invoke-RestMethod -Uri http://localhost:8080/generate -Method POST -ContentType "application/json; charset=utf-8" -Body "{\"prompt\": \"отфильтровать заказы\"}"'
+# Ответ: task_id; полный результат — через SSE /status или python tests/test_sse.py
 ```
 
 **Решение 4 — curl (всегда работает, UTF-8 по умолчанию):**
@@ -406,6 +478,7 @@ pwsh -Command 'Invoke-RestMethod -Uri http://localhost:8080/generate -Method POS
 curl -X POST http://localhost:8080/generate \
      -H "Content-Type: application/json" \
      -d '{"prompt": "отфильтровать заказы"}'
+# Ответ: {"task_id":"..."}; дальше curl -sN "http://localhost:8080/status?task_id=..." или python tests/test_sse.py
 ```
 
 **Влияние на продакшн:** нулевое. Python `httpx` всегда отправляет UTF-8.
@@ -563,7 +636,8 @@ ModuleNotFoundError test_base_cases_data   →   Баг #3 (импорт)       
 Первый запрос после паузы очень медленный  →   Баг #4 (KEEP_ALIVE)        §5.4
 luac: command not found на Windows         →   Баг #5 (DRY_RUN)           §5.5
 Ollama не отвечает изнутри Docker          →   Адрес должен быть ollama:11434, не localhost
-API отвечает, но код пустой                →   CoT-парсер не нашёл тег <code>
+API отвечает task_id, а «кода нет»       →   Смотри SSE до stage done; в POST /generate кода нет
+API / SSE ok, но code пустой             →   CoT-парсер не нашёл тег <code>
                                                Проверь system_prompt.txt
 Warm-up занимает больше 30 секунд          →   Модель не скачана или повреждена
                                                docker-compose run --rm ollama ollama list

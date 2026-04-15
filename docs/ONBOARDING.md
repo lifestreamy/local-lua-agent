@@ -1,5 +1,7 @@
 # ONBOARDING.md — Введение в проект LocalScript
 
+> Расположение в репозитории: `docs/ONBOARDING.md`
+
 **True Tech Hack 2026 · Трек 2**
 
 Этот документ поможет понять проект с самых основ — от предметной области и задачи
@@ -20,6 +22,7 @@
 9. [Среда Lua MWS: что нельзя и что можно](#9-среда-lua-mws-что-нельзя-и-что-можно)
 10. [Известные особенности и подводные камни](#10-известные-особенности-и-подводные-камни)
 11. [Полезные ссылки](#11-полезные-ссылки)
+12. [Ручной локальный запуск: Ollama, модели, uvicorn, тесты, CLI, Web UI](#12-ручной-локальный-запуск-ollama-модели-uvicorn-тесты-cli-web-ui)
 
 ---
 
@@ -53,15 +56,21 @@ wf.initVariables.limit   -- параметр инициализации
 Бизнес-аналитики не умеют программировать. Им нужно описать задачу словами,
 а получить готовый Lua-код, который можно скопировать и вставить в шаг платформы.
 
-**LocalScript** — HTTP API. Принимает текстовый запрос, возвращает Lua-код:
+**LocalScript** — HTTP API. Принимает `prompt` (и опционально `context`), ставит задачу в фон и возвращает **`task_id`**; готовый Lua и стадии пайплайна приходят в **SSE** на `GET /status?task_id=...`.
 
 ```
 Запрос:
   POST /generate
   {"prompt": "отфильтровать заказы со статусом выполнен"}
 
-Ответ:
-  {"code": "local result = _utils.array.new()\nfor _, o in ipairs(wf.vars.orders) do\n  if o.status == 'выполнен' then\n    table.insert(result, o)\n  end\nend\nreturn result"}
+Ответ (сразу):
+  {"task_id": "550e8400-e29b-41d4-a716-446655440000"}
+
+Далее клиент открывает поток:
+  GET /status?task_id=550e8400-e29b-41d4-a716-446655440000
+  Accept: text/event-stream
+
+В событиях SSE — JSON с полями stage, message, code, error; в конце в code — чистый Lua.
 ```
 
 Дополнительно поддерживается поле `context` — существующий Lua-код, который нужно доработать:
@@ -135,7 +144,7 @@ FastAPI снова:
         │  4. LuaValidator: luac -o /dev/null - (проверка синтаксиса)
         │  5. Если ошибка — добавить её в промпт и повторить (макс. 3 раза)
         ▼
-{"code": "return wf.vars..."}       ← чистый Lua без markdown-обёрток
+SSE: stage=done, поле code — чистый Lua без markdown-обёрток
 ```
 
 ### Что такое Chain-of-Thought (CoT)?
@@ -191,9 +200,6 @@ task-repo/
 │   Техническая документация. Архитектура C1/C2/C3, запуск,
 │   переменные среды, API-справка, известные ограничения.
 │
-├── ONBOARDING.md              ← этот файл
-│   Введение с нуля. Объясняет зачем, что и как — от основ до архитектуры.
-│
 ├── Dockerfile
 │   Образ для контейнера api.
 │   python:3.11-slim + lua5.4 (для luac) + Python-зависимости.
@@ -207,8 +213,8 @@ task-repo/
 │
 ├── api/
 │   ├── __init__.py            — пустой файл, делает директорию пакетом Python
-│   ├── main.py                — FastAPI app: /generate, /health, lifespan warm-up
-│   ├── models.py              — Pydantic: GenerateRequest (prompt + context), GenerateResponse (code)
+│   ├── main.py                — FastAPI: /generate, /status (SSE), /health, фоновые задачи
+│   ├── models.py              — Pydantic: GenerateRequest, TaskSubmitResponse (task_id), схемы SSE-событий
 │   ├── agent.py               — AgentPipeline: оркестратор всего процесса генерации
 │   │                            OllamaClient, CoT-парсер, retry loop
 │   ├── validator.py           — LuaValidator: вызывает luac, возвращает (ok, stderr)
@@ -221,6 +227,9 @@ task-repo/
 │       Изменение этого файла — основной способ улучшить точность системы.
 │
 ├── docs/
+│   ├── ONBOARDING.md
+│   │   Введение с нуля. Объясняет зачем, что и как — от основ до архитектуры.
+│   │
 │   ├── api_contract_description.md
 │   │   Подробное описание HTTP API: все поля запросов и ответов,
 │   │   примеры для curl/Python/PowerShell, кодировочная проблема PS 5.1.
@@ -229,9 +238,11 @@ task-repo/
 │   │   Все известные баги, с которыми мы столкнулись, и их решения.
 │   │   Рабочие процессы для отладки промптов и поведения модели.
 │   │
-│   └── architecture/
-│       Диаграммы C4: по одному файлу на каждый уровень.
-│       c1_context.md, c2_containers.md, c3_components.md
+│   ├── архитектура_С4_визуал.md
+│   │   Mermaid flowchart: C1–C3, прямые рёбра (curve: linear).
+│   │
+│   └── архитектура_С4-описание.md
+│       Текстовый уровень C4: модули, SSE, сценарии, риски.
 │
 └── tests/
     ├── test_base_cases_data.py
@@ -263,16 +274,15 @@ docker-compose run --rm ollama ollama pull qwen2.5-coder:7b-instruct-q4_K_M
 # 2. Запустить всё:
 docker-compose up --build
 
-# 3. Проверить:
-curl -X POST http://localhost:8080/generate \
+# 3. Проверить (async: сначала task_id, затем SSE — см. §12 или docs/DEBUGGING.md):
+curl -sS -X POST http://localhost:8080/generate \
      -H "Content-Type: application/json" \
      -d '{"prompt":"получить последний email из списка"}'
 ```
 
 ### На Windows без Docker (для разработки)
 
-Подробная инструкция с описанием всех нюансов — в `README.md` (раздел 8)
-и в `docs/DEBUGGING.md`.
+Пошаговый сценарий: **§12** ниже и [`DEBUGGING.md`](DEBUGGING.md) (сценарий B). Кратко также в [`README.md`](../README.md), раздел «Ручной запуск».
 
 ---
 
@@ -317,7 +327,7 @@ PowerShell 5.1 (встроенный в Windows 10/11) кодирует тело
 Это не баг модели — Qwen2.5-Coder поддерживает русский язык.
 Это баг среды отладки. Решение: передавать тело как UTF-8 байты или использовать PS 7+.
 
-Подробно — в `docs/DEBUGGING.md`.
+Подробно — в [`DEBUGGING.md`](DEBUGGING.md).
 
 ### Системный прокси (Clash Verge, Proxifier)
 
@@ -352,3 +362,145 @@ PowerShell 5.1 (встроенный в Windows 10/11) кодирует тело
 | Docker Compose | https://docs.docker.com/compose/ |
 | httpx (Python HTTP клиент) | https://www.python-httpx.org/ |
 | Pydantic v2 | https://docs.pydantic.dev/latest/ |
+
+---
+
+## 12. Ручной локальный запуск: Ollama, модели, uvicorn, тесты, CLI, Web UI
+
+Все команды ниже — из **корня репозитория** (`task-repo/`), если не сказано иное. API должен слушать **`http://127.0.0.1:8080`**, Ollama — **`http://127.0.0.1:11434`**.
+
+### 12.1 Терминал A — Ollama
+
+**Windows (PowerShell):**
+
+```powershell
+$env:OLLAMA_KEEP_ALIVE = "-1"   # не выгружать модель из памяти при простое
+ollama serve
+```
+
+**Linux / macOS:**
+
+```bash
+export OLLAMA_KEEP_ALIVE=-1
+ollama serve
+```
+
+Оставь этот терминал открытым. Дальше в **новом** терминале — загрузка моделей (один раз на машину):
+
+```bash
+# Основная модель (как в docker-compose), ~4.7 ГБ:
+ollama pull qwen2.5-coder:7b-instruct-q4_K_M
+
+# Лёгкая модель для CPU / быстрых проверок:
+ollama pull qwen2.5-coder:0.5b
+```
+
+Проверка, что Ollama отвечает (подставь нужное имя модели):
+
+```bash
+curl -sS http://127.0.0.1:11434/api/generate -H "Content-Type: application/json" \
+  -d '{"model":"qwen2.5-coder:0.5b","prompt":"hello","stream":false}'
+```
+
+Отдельно от API можно открыть **интерактивный чат с моделью** в терминале (пока работает `ollama serve`): **`ollama run qwen2.5-coder:0.5b`** (или другое имя после `pull`). Завершить сессию: чаще всего **`/bye`** в строке ввода или **Ctrl+C** (см. подсказку внизу экрана `ollama run`).
+
+Чтобы API ходил в **другую** модель, задай переменную **`OLLAMA_MODEL`** перед запуском uvicorn (см. §12.2).
+
+### 12.2 Терминал B — uvicorn (FastAPI)
+
+Из корня, с активированным venv и установленными зависимостями (`pip install -r requirements.txt`).
+
+**Windows (PowerShell):**
+
+```powershell
+$env:NO_PROXY          = "localhost,127.0.0.1,::1"
+$env:DRY_RUN           = "true"    # Windows без luac; в Linux с luac можно "false"
+$env:OLLAMA_BASE_URL   = "http://127.0.0.1:11434"
+$env:OLLAMA_MODEL      = "qwen2.5-coder:7b-instruct-q4_K_M"   # или qwen2.5-coder:0.5b
+$env:MAX_RETRIES       = "3"
+$env:OLLAMA_NUM_CTX    = "3072"
+$env:OLLAMA_NUM_PREDICT = "1024"
+uvicorn api.main:app --reload --host 127.0.0.1 --port 8080
+```
+
+**Linux / macOS:**
+
+```bash
+export NO_PROXY=localhost,127.0.0.1,::1
+export DRY_RUN=true
+export OLLAMA_BASE_URL=http://127.0.0.1:11434
+export OLLAMA_MODEL=qwen2.5-coder:7b-instruct-q4_K_M
+export MAX_RETRIES=3
+export OLLAMA_NUM_CTX=3072
+export OLLAMA_NUM_PREDICT=1024
+uvicorn api.main:app --reload --host 127.0.0.1 --port 8080
+```
+
+Проверка: `curl -sS http://127.0.0.1:8080/health` (ожидается HTTP 200, если модель скачана и имя совпадает с `OLLAMA_MODEL`).
+
+### 12.3 Папка `tests/` — что запускать и зачем
+
+| Файл / сценарий | Назначение |
+|-----------------|------------|
+| `tests/test_sse.py` | Скрипт: `POST /generate` → `task_id`, затем чтение SSE `/status` до `done`/`error`. Запуск: `python tests/test_sse.py` (API должен быть запущен). |
+| `tests/test_prompt_injection.py` | `unittest`: guard SAFE/UNSAFE через полный async API. Запуск: `python -m unittest tests.test_prompt_injection -v` |
+| `tests/test_session_contract.py` | Скрипт: 4 хода подряд с накоплением `context`. Запуск: `python tests/test_session_contract.py` |
+| `tests/test_session_stress.py` | Нагрузочный сценарий по списку промптов. Запуск: `python tests/test_session_stress.py` |
+| `tests/test_request.py` | Прямой запрос в Ollama `:11434` (минуя FastAPI). Запуск: `python -m unittest tests.test_request -v` |
+| `tests/test_base_cases.py` | Массовая проверка эталонных Lua по перефразировкам. **Важно:** код ожидает в ответе `POST /generate` поле `code` (legacy); при текущем контракте `task_id` + SSE тест **не будет** соответствовать ответу API, пока тест не обновлён. |
+| `tests/test_base_cases_data.py` | Данные для `test_base_cases.py` (не запускается отдельно). |
+| `tests/test_base_cases_1_for_testcases.py` | Черновик новых кейсов для вставки в `TEST_CASES`. |
+| `tests/validate_lua_examples.py` | Утилита: разбор файла с блоками «ЗАПРОС / КОД», проверка фрагментов через `luac -p`. Запуск: `python tests/validate_lua_examples.py --help`. |
+| `tests/parsing/test_parse_brackets.py` | Зарезервирован под парсинг (файл пока пустой). |
+
+Общий пример:
+
+```bash
+python -m unittest tests.test_prompt_injection -v
+python tests/test_sse.py
+```
+
+### 12.4 CLI-клиент (`cli-client`)
+
+Терминал C, **корень репозитория**, API уже на `:8080`:
+
+```powershell
+pip install -r requirements.txt
+python cli-client/chat.py
+```
+
+По умолчанию клиент ходит на `http://localhost:8080` (см. `BASE_URL` в `cli-client/chat.py`).
+
+**Внутри интерактивного окна:**
+
+- Любой текст и **Enter** — отправить запрос в API (история для следующего хода накапливается автоматически).
+- **`exit`** — выход.
+- **`clear`** — очистить rolling context (начать диалог заново).
+- **Стрелки вверх / вниз** — история введённых строк (prompt_toolkit).
+
+Примеры коротких запросов на Lua под MWS:
+
+- `верни последний элемент массива wf.vars.emails`
+- `создай пустой массив через _utils.array.new и верни его`
+
+### 12.5 Web UI
+
+Терминал D:
+
+```bash
+cd web-ui
+npm install
+npm run dev
+```
+
+Открой в браузере **`http://localhost:3000`**. Если API не на `localhost:8080`, перед `npm run dev` задай:
+
+```bash
+# Linux / macOS
+export NEXT_PUBLIC_API_BASE=http://127.0.0.1:8080
+
+# Windows PowerShell
+$env:NEXT_PUBLIC_API_BASE = "http://127.0.0.1:8080"
+```
+
+Дополнительно по отладке (прокси, PS 5.1, UTF-8) — [`DEBUGGING.md`](DEBUGGING.md).
