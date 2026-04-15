@@ -1,8 +1,9 @@
-# API Contract — LocalScript
+# API Contract — LocalScript (v3 — Async SSE & Conversational Messages)
 
 > Расположение в репозитории: `docs/api_contract_description.md`
 
-Этот документ описывает HTTP API сервиса **LocalScript** — локального агента для генерации Lua-кода по заданию на естественном языке.
+Этот документ описывает HTTP API сервиса **LocalScript** — локального агента для генерации Lua-кода.
+**ВНИМАНИЕ:** API переведено на асинхронную модель с Server-Sent Events (SSE). Агент теперь может не только выдавать код, но и вести диалог (задавать уточняющие вопросы).
 
 ***
 
@@ -16,9 +17,9 @@ http://localhost:8080
 
 ## Endpoints
 
-### `POST /generate`
+### 1. `POST /generate`
 
-Принять задание на естественном языке, вернуть сгенерированный Lua-код.
+Отправить задание в очередь на генерацию.
 
 #### Запрос
 
@@ -31,61 +32,66 @@ Content-Type: application/json; charset=utf-8
 
 | Поле | Тип | Обязательно | Описание |
 |------|-----|-------------|----------|
-| `prompt` | `string` | ✅ | Текст задания на русском или английском языке |
-| `context` | `string` | ❌ | Существующий Lua-код, который нужно дополнить или исправить |
+| `prompt` | `string` | ✅ | Полный ввод пользователя (вопрос + сам код, если он его вставил). Всё отправляется единым текстом. |
+| `context` | `string` | ❌ | История диалога (rolling context) для мульти-turn чата. **Лимит: 4096 символов.** Если больше — фронтенд должен обрезать старые сообщения. |
 
-**Пример — генерация с нуля:**
-
-```json
-{
-  "prompt": "Отфильтровать заказы со статусом 'выполнен' из wf.vars.orders"
-}
-```
-
-**Пример — доработка существующего кода:**
+**Пример запроса:**
 
 ```json
 {
-  "prompt": "Добавить проверку: если массив пустой — вернуть nil",
-  "context": "local result = _utils.array.new()\nfor _, o in ipairs(wf.vars.orders) do\n  table.insert(result, o)\nend\nreturn result"
+  "prompt": "Исправь этот код: \n```lua\nreturn 1\n```\nДобавь проверку на nil.",
+  "context": "User: как создать массив?\nAssistant: используй _utils.array.new()"
 }
 ```
 
-#### Ответ
+#### Ответ (HTTP 200 OK)
 
-**HTTP 200 OK**
-
-```http
-Content-Type: application/json; charset=utf-8
-```
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| `code` | `string` | Готовый Lua-код. Чистая строка без markdown-обёрток |
-
-**Пример ответа:**
+Возвращает ID задачи для последующего поллинга через SSE.
 
 ```json
 {
-  "code": "local result = _utils.array.new()\nfor _, o in ipairs(wf.vars.orders) do\n  if o.status == 'выполнен' then\n    table.insert(result, o)\n  end\nend\nreturn result"
+  "task_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
-
-**HTTP 422 Unprocessable Entity** — некорректное тело запроса (Pydantic validation error):
-
-```json
-{
-  "detail": [{"loc": ["body", "prompt"], "msg": "field required", "type": "value_error.missing"}]
-}
-```
-
-**HTTP 500 Internal Server Error** — Ollama недоступен или ответил некорректно.
 
 ***
 
-### `GET /health`
+### 2. `GET /status`
 
-Проверка доступности сервиса.
+Получить поток статусов генерации (Server-Sent Events).
+
+#### Запрос
+
+```http
+GET /status?task_id=550e8400-e29b-41d4-a716-446655440000
+Accept: text/event-stream
+```
+
+#### Ответ (HTTP 200 OK — Stream)
+
+Стримит JSON-объекты. Теперь включает поле `message` для текстовых ответов или вопросов от LLM.
+
+**Пример 1: Успешная генерация кода с пояснением от модели**
+```json
+data: {"stage": "pending", "message": "", "code": "", "error": ""}
+data: {"stage": "generating", "message": "Я понял задачу. Использую _utils.array.new().", "code": "", "error": ""}
+data: {"stage": "validating", "message": "", "code": "", "error": ""}
+data: {"stage": "done", "message": "Вот исправленный код:", "code": "local r = _utils.array.new()\nreturn r", "error": ""}
+```
+
+**Пример 2: Агент задает уточняющий вопрос (Clarification Loop)**
+Если промпт непонятен, агент не генерирует код, а спрашивает детали. В этом случае `code` будет пустым.
+```json
+data: {"stage": "pending", "message": "", "code": "", "error": ""}
+data: {"stage": "generating", "message": "", "code": "", "error": ""}
+data: {"stage": "done", "message": "Уточните, пожалуйста: фильтровать только активные заказы или вообще все?", "code": "", "error": ""}
+```
+
+***
+
+### 3. `GET /health`
+
+Проверка доступности сервиса. (В будущем будет дополнено статусом модели и GPU для баллов).
 
 ```http
 GET /health
@@ -99,7 +105,7 @@ GET /health
 
 ***
 
-## Важные ограничения поля `code` в ответе
+## Важные ограничения поля `code` в итоговом ответе SSE
 
 - Возвращается **чистый Lua** без обёртки в markdown (без `` ```lua `` и `` ``` ``).
 - Должен заканчиваться оператором `return`.
@@ -111,104 +117,11 @@ GET /health
 
 ## Важная заметка для Windows-разработчиков — кодировка
 
-### Проблема
-
-**PowerShell 5.1** (встроенный в Windows 10/11) кодирует тело `-Body` в Invoke-RestMethod как **ASCII**, не как UTF-8.
-Кириллические символы при этом заменяются на `?????????`, и модель их не распознаёт.
-
-### Проверка версии PowerShell
-
-```powershell
-$PSVersionTable.PSVersion
-# Major = 5 → проблема с кодировкой
-# Major = 7 → UTF-8 по умолчанию, проблем нет
-```
-
-### Решение для PowerShell 5.1
-
-```powershell
-# Явно кодировать тело в UTF-8 байты перед отправкой:
-$json = '{"prompt": "Привет, сгенерируй код"}'
-$bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-Invoke-RestMethod -Uri http://localhost:8080/generate `
-    -Method POST `
-    -ContentType "application/json; charset=utf-8" `
-    -Body $bytes
-```
-
-### Решение через файл
-
-```powershell
-# Сохранить тело в файл UTF-8 без BOM, передать как -InFile:
-$json = '{"prompt": "Привет, сгенерируй код"}' | Out-File -Encoding utf8NoBOM body.json
-Invoke-RestMethod -Uri http://localhost:8080/generate `
-    -Method POST `
-    -ContentType "application/json; charset=utf-8" `
-    -InFile body.json
-```
-
-### Решение для curl (всегда работает):
+**PowerShell 5.1** кодирует тело `-Body` как **ASCII**, заменяя кириллицу на `?????????`.
+Используйте `curl` или Python (`httpx`) для тестов, либо явно кодируйте в UTF-8:
 
 ```bash
 curl -X POST http://localhost:8080/generate \
      -H "Content-Type: application/json; charset=utf-8" \
      -d '{"prompt": "Отфильтровать выполненные заказы"}'
 ```
-
-***
-
-## Примеры использования
-
-### curl (Linux / macOS / Git Bash)
-
-```bash
-# Базовый запрос
-curl -X POST http://localhost:8080/generate \
-     -H "Content-Type: application/json" \
-     -d '{"prompt": "Получить последний email из wf.vars.emails"}'
-
-# С передачей контекста
-curl -X POST http://localhost:8080/generate \
-     -H "Content-Type: application/json" \
-     -d '{"prompt": "Добавить фильтрацию пустых значений", "context": "return wf.vars.items"}'
-```
-
-### Python (httpx)
-
-```python
-import httpx
-
-r = httpx.post("http://localhost:8080/generate", json={
-    "prompt": "Отфильтровать заказы со статусом выполнен"
-})
-print(r.json()["code"])
-```
-
-### PowerShell 5.1 (с корректной кодировкой UTF-8)
-
-```powershell
-$json = '{"prompt": "Получить последний email из массива"}'
-$bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-$response = Invoke-RestMethod -Uri http://localhost:8080/generate `
-    -Method POST `
-    -ContentType "application/json; charset=utf-8" `
-    -Body $bytes
-Write-Host $response.code
-```
-
-### PowerShell 7+ (pwsh)
-
-```powershell
-# Работает напрямую — UTF-8 по умолчанию с PS 7.4+
-Invoke-RestMethod -Uri http://localhost:8080/generate `
-    -Method POST `
-    -ContentType "application/json; charset=utf-8" `
-    -Body '{"prompt": "Получить последний email из массива"}'
-```
-
-***
-
-## OpenAPI-совместимость
-
-Базовая схема контракта (`openapi.yaml`) находится в корне репозитория.
-Контракт расширяем: допустимо добавлять поля и endpoints при условии сохранения обратной совместимости с базовым `POST /generate`.

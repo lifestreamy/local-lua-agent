@@ -1,70 +1,68 @@
 """
 tests/test_prompt_injection.py — Tests for the prompt injection guard (api/guard.py).
 
-Requires:
-    - Uvicorn running: uvicorn api.main:app --host 0.0.0.0 --port 8080
-    - Ollama running with the model loaded
-
-Run:
-    python -m unittest tests.test_prompt_injection -v
+UPDATED for SSE API (v3):
+Uses a fast mock client to hit `POST /generate` and polls `GET /status`
+to verify if the pipeline aborted immediately with SECURITY_BLOCK.
 """
 
 import unittest
+import asyncio
 import httpx
+import json
 
 from tests.injection_data import SAFE_PROMPTS, UNSAFE_PROMPTS
 from tests.log_utils import print_table, save_markdown_report
 
-API_URL = "http://localhost:8080/generate"
+API_URL = "http://localhost:8080"
 SECURITY_BLOCK_MARKER = "[SECURITY_BLOCK]"
 
 
-class TestPromptInjectionGuard(unittest.TestCase):
+class TestPromptInjectionGuard(unittest.IsolatedAsyncioTestCase):
     """Verifies guard correctly allows safe prompts and blocks malicious/off-topic ones."""
 
     @classmethod
     def setUpClass(cls):
-        cls.client = httpx.Client(timeout=45.0)
         cls.results = []
 
     @classmethod
     def tearDownClass(cls):
-        cls.client.close()
         print_table(cls.results, title="Prompt Injection Guard — Test Results")
         save_markdown_report(cls.results, title="Prompt Injection Guard Test Report")
 
-    def _post(self, prompt: str) -> str:
-        response = self.client.post(API_URL, json={"prompt": prompt})
-        self.assertEqual(response.status_code, 200, f"API non-200 for: {prompt}")
-        return response.json().get("code", "")
+    async def _run_sse_test(self, prompt: str) -> str:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            # 1. Submit task
+            post_resp = await client.post(f"{API_URL}/generate", json={"prompt": prompt})
+            self.assertEqual(post_resp.status_code, 200)
+            task_id = post_resp.json().get("task_id")
 
-    def test_safe_prompts_allowed(self):
+            # 2. Consume SSE stream until "done" or "error"
+            async with client.stream("GET", f"{API_URL}/status", params={"task_id": task_id}) as stream_resp:
+                async for line in stream_resp.aiter_lines():
+                    if line.startswith("data: "):
+                        payload = json.loads(line.removeprefix("data: "))
+                        if payload["stage"] in ("done", "error"):
+                            return payload.get("code", "")
+        return ""
+
+    async def test_safe_prompts_allowed(self):
         """All genuine coding tasks must pass the guard."""
         for prompt, description in SAFE_PROMPTS:
             with self.subTest(msg=description, prompt=prompt):
-                code = self._post(prompt)
-                passed = SECURITY_BLOCK_MARKER not in code and len(code.strip()) > 0
-                self.__class__.results.append(
-                    (prompt, "ALLOWED", code, passed)
-                )
-                self.assertNotIn(
-                    SECURITY_BLOCK_MARKER, code,
-                    f"Guard incorrectly blocked safe prompt: {prompt!r}\nGot: {code!r}"
-                )
+                code = await self._run_sse_test(prompt)
+                passed = SECURITY_BLOCK_MARKER not in code
+                self.__class__.results.append((prompt, "ALLOWED", code[:50], passed))
+                self.assertNotIn(SECURITY_BLOCK_MARKER, code)
 
-    def test_unsafe_prompts_blocked(self):
+    async def test_unsafe_prompts_blocked(self):
         """All injections and off-topic prompts must be blocked."""
         for prompt, description in UNSAFE_PROMPTS:
             with self.subTest(msg=description, prompt=prompt):
-                code = self._post(prompt)
+                code = await self._run_sse_test(prompt)
                 passed = SECURITY_BLOCK_MARKER in code
-                self.__class__.results.append(
-                    (prompt, "BLOCKED", code, passed)
-                )
-                self.assertIn(
-                    SECURITY_BLOCK_MARKER, code,
-                    f"Guard failed to block unsafe prompt: {prompt!r}\nGot: {code!r}"
-                )
+                self.__class__.results.append((prompt, "BLOCKED", code[:50], passed))
+                self.assertIn(SECURITY_BLOCK_MARKER, code)
 
 
 if __name__ == "__main__":

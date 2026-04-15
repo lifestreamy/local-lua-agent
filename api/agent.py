@@ -1,26 +1,7 @@
-"""
-api/agent.py — Ollama client and AgentPipeline.
-
-Pipeline steps:
-1. Build prompt (system_prompt + optional context + user task).
-2. POST to Ollama /api/generate.
-3. Extract Lua from <code>...</code> section of the response.
-4. Validate with luac.
-5. If invalid and retries remain → rebuild prompt with error context, go to 2.
-6. After MAX_RETRIES failures → return best attempt.
-
-Response format expected from LLM:
-<thinking>
-  ...reasoning...
-</thinking>
-<code>
-  ...raw lua code...
-</code>
-"""
-
 import logging
 import os
 import re
+import asyncio
 
 import httpx
 
@@ -34,22 +15,22 @@ OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
 MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
 
+# Configurable Context & Prediction Limits
+OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "3072"))
+OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "1024"))
+
 OLLAMA_OPTIONS: dict = {
-    "num_ctx": 4096,
-    "num_predict": 512,
-    "temperature": 0.1, # если условия требуют точное совпадение, поставить 0.0
-    "seed": 42, # для воспроизводимости (температура 0 + seed = максимальный детерминизм)
+    "num_ctx": OLLAMA_NUM_CTX,
+    "num_predict": OLLAMA_NUM_PREDICT,
+    "temperature": 0.4,
 }
 
-
-class OllamaClient:
-    """Thin HTTP client for Ollama /api/generate (non-streaming)."""
-
+class AsyncOllamaClient:
     def __init__(self, base_url: str = OLLAMA_BASE_URL, model: str = OLLAMA_MODEL) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
 
-    def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str) -> str:
         url = f"{self.base_url}/api/generate"
         payload = {
             "model": self.model,
@@ -58,104 +39,108 @@ class OllamaClient:
             "options": OLLAMA_OPTIONS,
         }
         logger.debug("POST %s model=%s prompt_len=%d", url, self.model, len(prompt))
-        response = httpx.post(url, json=payload, timeout=60.0)
-        response.raise_for_status()
-        return response.json().get("response", "")
 
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, timeout=120.0)
+            response.raise_for_status()
+            return response.json().get("response", "")
 
-def _extract_lua_code(raw: str) -> str:
-    """
-    Extract Lua code from the LLM response.
+def _parse_llm_response(raw: str) -> tuple[str, str]:
+    code = ""
+    message = ""
 
-    Priority:
-    1. Parse <code>...</code> tag (our primary CoT format).
-    2. Strip markdown fences ```lua...``` as fallback (model disobedience).
-    3. Return the entire raw string stripped as last resort.
-    """
-    # Primary: <code>...</code>
     code_tag = re.search(r"<code>(.*?)</code>", raw, re.DOTALL | re.IGNORECASE)
     if code_tag:
-        return code_tag.group(1).strip()
+        code = code_tag.group(1).strip()
+        message = re.sub(r"<code>.*?</code>", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
+        message = re.sub(r"</?thinking>", "", message, flags=re.IGNORECASE).strip()
+        return message, code
 
-    # Fallback 1: ```lua ... ``` or ``` ... ```
     fenced = re.search(r"```(?:lua)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
     if fenced:
-        return fenced.group(1).strip()
+        code = fenced.group(1).strip()
+        message = re.sub(r"```(?:lua)?\s*\n?.*?\n?```", "", raw, flags=re.DOTALL).strip()
+        return message, code
 
-    # Fallback 2: raw string (model ignored all formatting)
-    return raw.strip()
+    return raw.strip(), ""
 
+def _truncate_context_for_agent(context: str, max_chars: int = 2500) -> str:
+    """Hard cap the context window to strictly fit inside num_ctx with room to spare."""
+    if not context or len(context) <= max_chars:
+        return context
+
+    truncated = context[-max_chars:]
+    user_idx = truncated.find("User:")
+    if user_idx != -1:
+        return truncated[user_idx:]
+    return truncated
 
 class AgentPipeline:
-    """
-    Оркестратор полного цикла: генерация → валидация → исправление.
-
-    Принимает GenerateRequest с полями prompt и опциональным context.
-    Передаёт оба поля в PromptBuilder, который формирует финальный промпт.
-    Повторяет попытки до MAX_RETRIES, передавая ошибку luac обратно в модель.
-    """
-
     def __init__(
             self,
-            ollama_client: OllamaClient | None = None,
+            ollama_client: AsyncOllamaClient | None = None,
             prompt_builder: PromptBuilder | None = None,
             validator: LuaValidator | None = None,
     ) -> None:
-        self.ollama = ollama_client or OllamaClient()
+        self.ollama = ollama_client or AsyncOllamaClient()
         self.builder = prompt_builder or PromptBuilder()
         self.validator = validator or LuaValidator()
 
-    def generate(self, request: GenerateRequest) -> str:
-        """
-        Генерирует валидный Lua-код по запросу пользователя.
-
-        Аргументы:
-            request: Pydantic-модель с полями:
-                     - prompt  (обязательно) — текст задачи на естественном языке
-                     - context (опционально) — существующий Lua-код для доработки
-
-        Возвращает:
-            Строку Lua-кода — либо синтаксически валидную, либо лучший вариант
-            из всех попыток, если ни одна не прошла валидацию.
-        """
+    async def generate_stream(self, request: GenerateRequest):
         error_context: str | None = None
         best_code: str = ""
+        last_error: str = ""
+
+        # SERVER-SIDE CONTEXT HARD CAP (2500 chars)
+        safe_context = _truncate_context_for_agent(request.context, max_chars=2500)
 
         for attempt in range(1, MAX_RETRIES + 1):
-            logger.info(
-                "Attempt %d/%d | prompt=%r | has_context=%s",
-                attempt, MAX_RETRIES,
-                request.prompt[:60],
-                bool(request.context),
-            )
+            logger.info("Attempt %d/%d | prompt=%r", attempt, MAX_RETRIES, request.prompt[:60])
+
+            yield {"stage": "generating", "message": f"Попытка {attempt} из {MAX_RETRIES}...", "code": best_code, "error": ""}
 
             prompt = self.builder.build(
                 prompt=request.prompt,
-                context=request.context,
+                context=safe_context,
                 error_context=error_context,
             )
 
             try:
-                raw_response = self.ollama.generate(prompt)
+                raw_response = await self.ollama.generate(prompt)
             except httpx.HTTPError as exc:
                 logger.error("Ollama HTTP error attempt %d: %s", attempt, exc)
                 error_context = f"HTTP error: {exc}"
+                last_error = error_context
+                yield {"stage": "retrying", "message": "Сетевая ошибка Ollama", "code": best_code, "error": last_error}
+                await asyncio.sleep(1)
                 continue
 
-            code = _extract_lua_code(raw_response)
+            message, code = _parse_llm_response(raw_response)
+
+            if not code:
+                logger.info("No code detected. Treating as Clarification Loop.")
+                yield {"stage": "done", "message": message, "code": "", "error": ""}
+                return
 
             if not best_code:
                 best_code = code
 
-            is_valid, lua_error = self.validator.validate(code)
+            yield {"stage": "validating", "message": "Проверка синтаксиса (luac)...", "code": code, "error": ""}
+
+            is_valid, lua_error = await asyncio.to_thread(self.validator.validate, code)
 
             if is_valid:
                 logger.info("Valid Lua on attempt %d.", attempt)
-                return code
+                yield {"stage": "done", "message": message, "code": code, "error": ""}
+                return
 
             logger.warning("Attempt %d invalid syntax: %s", attempt, lua_error)
             best_code = code
             error_context = lua_error
+            last_error = lua_error
+
+            if attempt < MAX_RETRIES:
+                yield {"stage": "retrying", "message": "Найдена ошибка синтаксиса, исправляю...", "code": code, "error": lua_error}
 
         logger.error("All %d attempts failed. Returning best attempt.", MAX_RETRIES)
-        return best_code
+        yield {"stage": "error", "message": "Не удалось сгенерировать валидный код за отведенное число попыток.", "code": best_code, "error": last_error}

@@ -7,6 +7,10 @@ venv/
 env/
 .env
 
+# Python tests reports
+/tests/reports/
+
+
 # JetBrains (PyCharm / IntelliJ)
 .idea/
 # Whitelist shared run configurations
@@ -27,11 +31,3 @@ env/
 .DS_Store
 Thumbs.db
 
-# Jujutsu VCS
-.jj/
-
-# Python Tests
-tests/reports/
-tests/reports/*.json
-tests/reports/*.md
-tests/reports/*.log
