@@ -1,0 +1,5 @@
+# EN: This file ensures only the repository owner (Tim Korelov) can approve Pull Requests.
+# The '*' wildcard means "every file in the repository".
+# RU: Этот файл гарантирует, что только владелец репозитория (Tim Korelov) может одобрять Pull Requests.
+# Символ '*' означает "каждый файл в репозитории".
+* @lifestreamy
